@@ -34,8 +34,24 @@ class DeviceManager:
         
         try:
             # Get all available devices
-            self.available_devices = self.adb.get_all_available_devices()
-            logger.info(f"Found {len(self.available_devices)} device(s)")
+            all_devices = self.adb.get_all_available_devices()
+            logger.info(f"Found {len(all_devices)} device(s)")
+            
+            # Filter out devices with unknown models
+            self.available_devices = []
+            unknown_devices = []
+            
+            for device in all_devices:
+                if device.get('model') == 'Unknown' or not device.get('model'):
+                    unknown_devices.append(device)
+                    logger.debug(f"Filtering out device with unknown model: {device['id']}")
+                else:
+                    self.available_devices.append(device)
+            
+            if unknown_devices:
+                logger.info(f"Filtered out {len(unknown_devices)} device(s) with unknown models")
+            
+            logger.info(f"Available devices after filtering: {len(self.available_devices)}")
             
             # Enhance device info with game status
             self._enhance_devices_with_game_status()

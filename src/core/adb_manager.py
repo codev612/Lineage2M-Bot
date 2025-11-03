@@ -238,14 +238,32 @@ class ADBManager:
     def execute_adb_command(self, command: List[str]) -> Tuple[bool, str]:
         """Execute ADB command and return success status and output"""
         if not self.connected or not self.device_id:
-            raise ADBError("Not connected to any device")
+            error_msg = f"Not connected - connected={self.connected}, device_id={self.device_id}"
+            logger.error(f"ADBManager.execute_adb_command: {error_msg}")
+            raise ADBError(error_msg)
         
         full_command = ['adb', '-s', self.device_id] + command
+        logger.info(f"ADBManager executing: {' '.join(full_command)}")
         try:
             result = subprocess.run(full_command, capture_output=True, text=True, timeout=self.timeout)
-            return result.returncode == 0, result.stdout if result.returncode == 0 else result.stderr
+            success = result.returncode == 0
+            output = result.stdout if success else result.stderr
+            
+            if not success:
+                logger.warning(f"ADB command failed: {' '.join(full_command)}")
+                logger.warning(f"Return code: {result.returncode}, Error output: {output}")
+            else:
+                logger.info(f"ADB command succeeded: {' '.join(full_command)}")
+                if output and len(output.strip()) > 0:
+                    logger.info(f"Command output: {output.strip()[:200]}")  # First 200 chars
+            
+            return success, output
         except subprocess.TimeoutExpired:
+            logger.error(f"ADB command timeout: {' '.join(full_command)}")
             raise ConnectionTimeoutError("ADB command timeout")
+        except Exception as e:
+            logger.error(f"ADB command exception: {' '.join(full_command)}, error: {e}", exc_info=True)
+            raise
     
     def is_app_running(self, package_name: str) -> bool:
         """Check if a specific app is currently running"""

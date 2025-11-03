@@ -96,6 +96,9 @@ class BotConfig:
     save_screenshots: bool = True
     screenshot_directory: str = "screenshots"
     
+    # Multi-device settings
+    max_devices: int = 3
+    
 class ConfigManager:
     """
     Configuration manager for the Lineage 2M Bot
@@ -163,7 +166,8 @@ class ConfigManager:
             'logging': {},
             'auto_select_single_device': True,
             'save_screenshots': True,
-            'screenshot_directory': 'screenshots'
+            'screenshot_directory': 'screenshots',
+            'max_devices': 3
         }
     
     def _merge_configs(self, base: Dict, override: Dict) -> Dict:
@@ -210,7 +214,8 @@ class ConfigManager:
                 'logging': asdict(LoggingConfig()),
                 'auto_select_single_device': True,
                 'save_screenshots': True,
-                'screenshot_directory': 'screenshots'
+                'screenshot_directory': 'screenshots',
+                'max_devices': 3
             }
             
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -259,7 +264,8 @@ class ConfigManager:
                 'logging': asdict(self.config.logging),
                 'auto_select_single_device': self.config.auto_select_single_device,
                 'save_screenshots': self.config.save_screenshots,
-                'screenshot_directory': self.config.screenshot_directory
+                'screenshot_directory': self.config.screenshot_directory,
+                'max_devices': self.config.max_devices
             }
             
             with open(self.config_file, 'w', encoding='utf-8') as f:

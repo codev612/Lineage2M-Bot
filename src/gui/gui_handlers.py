@@ -5,7 +5,10 @@ Extension of the MainWindow class with all event handling methods
 
 import tkinter as tk
 from tkinter import messagebox, filedialog
+import customtkinter as ctk
+from typing import List, Dict, Any, Optional
 import threading
+import time
 import json
 import yaml
 from pathlib import Path
@@ -16,6 +19,7 @@ import cv2
 import numpy as np
 
 from ..core.device_manager import DeviceManager
+from ..core.multi_device_manager import MultiDeviceManager
 from ..modules.game_detector import GameDetector
 from ..utils.config import config_manager
 from ..utils.logger import get_logger
@@ -30,7 +34,7 @@ class GUIEventHandlers:
     """
     
     def _discover_devices(self):
-        """Discover available devices"""
+        """Discover available devices and auto-connect to game-ready devices"""
         def discover_thread():
             try:
                 self._update_status("🔍 Discovering devices...")
@@ -40,11 +44,55 @@ class GUIEventHandlers:
                 devices = self.device_manager.discover_devices_with_game_priority()
                 self.devices_list = devices
                 
-                # Update GUI in main thread
-                self.message_queue.put({
-                    'type': 'devices_discovered',
-                    'devices': devices
-                })
+                # Auto-connect to game-ready devices
+                game_ready_devices = []
+                for device in devices:
+                    game_status = device.get('game_status', {})
+                    if game_status.get('installed') or game_status.get('running'):
+                        game_ready_devices.append(device)
+                
+                # Connect to game-ready devices automatically
+                if game_ready_devices:
+                    device_status = self.multi_device_manager.get_device_status()
+                    max_devices = device_status['max_devices']
+                    available_slots = device_status['available_slots']
+                    
+                    devices_to_connect = min(len(game_ready_devices), available_slots)
+                    self._update_status(f"🎮 Auto-connecting to {devices_to_connect}/{len(game_ready_devices)} game-ready devices (Limit: {max_devices})...")
+                    
+                    connected_count = 0
+                    for device in game_ready_devices[:devices_to_connect]:  # Only try to connect up to available slots
+                        try:
+                            if self.multi_device_manager.connect_device(device['id'], device):
+                                connected_count += 1
+                                logger.info(f"Auto-connected to game-ready device: {device['id']}")
+                        except Exception as e:
+                            logger.error(f"Failed to auto-connect to {device['id']}: {e}")
+                    
+                    # Get updated device status
+                    final_status = self.multi_device_manager.get_device_status()
+                    
+                    if connected_count > 0:
+                        self.message_queue.put({
+                            'type': 'devices_discovered_and_connected',
+                            'devices': devices,
+                            'connected_count': connected_count,
+                            'device_status': final_status
+                        })
+                    else:
+                        self.message_queue.put({
+                            'type': 'devices_discovered',
+                            'devices': devices,
+                            'device_status': final_status
+                        })
+                else:
+                    # No game-ready devices found
+                    device_status = self.multi_device_manager.get_device_status()
+                    self.message_queue.put({
+                        'type': 'devices_discovered',
+                        'devices': devices,
+                        'device_status': device_status
+                    })
                 
             except Exception as e:
                 logger.error(f"Error discovering devices: {e}")
@@ -63,7 +111,7 @@ class GUIEventHandlers:
         self._discover_devices()
     
     def _connect_to_device(self):
-        """Connect to the selected device"""
+        """Connect to the selected device (legacy single-device mode)"""
         if not self.selected_device:
             messagebox.showwarning("No Device", "Please select a device first.")
             return
@@ -103,19 +151,153 @@ class GUIEventHandlers:
         # Run in separate thread
         threading.Thread(target=connect_thread, daemon=True).start()
     
+
+    
+    def _select_all_devices(self):
+        """Select all available devices"""
+        if not hasattr(self, 'devices_list'):
+            messagebox.showwarning("No Devices", "Please discover devices first.")
+            return
+        
+        # Toggle all devices in the tree
+        for item in self.device_tree.get_children():
+            values = list(self.device_tree.item(item, "values"))
+            values[0] = "☑️"  # Select checkbox
+            self.device_tree.item(item, values=values)
+        
+        self._update_button_states()
+    
+    def _disconnect_all_devices(self):
+        """Disconnect from all devices"""
+        def disconnect_thread():
+            try:
+                self._update_status("🚫 Disconnecting from all devices...")
+                self._show_progress()
+                
+                self.multi_device_manager.disconnect_all()
+                
+                self.message_queue.put({
+                    'type': 'all_devices_disconnected'
+                })
+                
+            except Exception as e:
+                logger.error(f"Error disconnecting from devices: {e}")
+                self.message_queue.put({
+                    'type': 'error',
+                    'message': f"Failed to disconnect from devices: {e}"
+                })
+            finally:
+                self._hide_progress()
+        
+        # Run in separate thread
+        threading.Thread(target=disconnect_thread, daemon=True).start()
+    
+    def _get_selected_devices_from_tree(self) -> List[Dict[str, Any]]:
+        """Get devices that are selected in the tree view"""
+        selected_devices = []
+        seen_device_ids = set()  # Track seen device IDs to prevent duplicates
+        
+        if not hasattr(self, 'devices_list'):
+            return selected_devices
+        
+        for item in self.device_tree.get_children():
+            values = self.device_tree.item(item, "values")
+            if len(values) > 0 and values[0] == "☑️":  # Checkbox is checked
+                device_id = self.device_tree.item(item, "text").replace(" ⭐", "")  # Remove star
+                
+                # Skip if we've already seen this device_id
+                if device_id in seen_device_ids:
+                    logger.warning(f"Duplicate device_id found in tree: {device_id}, skipping")
+                    continue
+                
+                seen_device_ids.add(device_id)
+                
+                # Find the corresponding device info
+                for device in self.devices_list:
+                    if device['id'] == device_id:
+                        selected_devices.append(device)
+                        break
+        
+        return selected_devices
+    
+    def _auto_select_connected_devices(self, connected_devices: Dict[str, Any]):
+        """Auto-select (check) connected devices in the device tree"""
+        if not hasattr(self, 'device_tree'):
+            return
+        
+        # Update each item in the tree
+        for item in self.device_tree.get_children():
+            device_id = self.device_tree.item(item, "text").replace(" ⭐", "")  # Remove star
+            values = list(self.device_tree.item(item, "values"))
+            
+            if len(values) > 0:
+                # Auto-select connected devices
+                if device_id in connected_devices:
+                    values[0] = "☑️"  # Check the checkbox
+                    logger.info(f"Auto-selected connected device: {device_id}")
+                else:
+                    values[0] = "☐"   # Uncheck if not connected
+                
+                self.device_tree.item(item, values=values)
+    
+    def _refresh_device_connections(self):
+        """Refresh the connection status display in the device tree"""
+        connected_devices = self.multi_device_manager.get_connected_devices()
+        
+        # Update each item in the tree
+        for item in self.device_tree.get_children():
+            device_id = self.device_tree.item(item, "text").replace(" ⭐", "")  # Remove star
+            values = list(self.device_tree.item(item, "values"))
+            
+            if len(values) >= 8:  # Ensure we have enough columns
+                # Update connection status column
+                if device_id in connected_devices:
+                    values[7] = "🟢 Connected"  # Connection column
+                else:
+                    values[7] = "🔴 Disconnected"
+                
+                self.device_tree.item(item, values=values)
+    
     def _on_device_select(self, event):
-        """Handle device selection in the tree"""
+        """Handle device selection in the tree - toggle checkbox"""
         selection = self.device_tree.selection()
         if selection:
             item_id = selection[0]
             device_id = self.device_tree.item(item_id, "text")
             
-            # Find the device in our list
-            for device in self.devices_list:
-                if device['id'] == device_id:
-                    self.selected_device = device
-                    self.connect_btn.configure(state="normal")
-                    break
+            # Toggle checkbox for multi-device mode
+            if self.multi_device_mode:
+                values = list(self.device_tree.item(item_id, "values"))
+                if len(values) > 0:
+                    # Toggle checkbox state
+                    if values[0] == "☐":
+                        values[0] = "☑️"
+                    else:
+                        values[0] = "☐"
+                    self.device_tree.item(item_id, values=values)
+                    
+                    self._update_button_states()
+            else:
+                # Legacy single-device mode
+                if hasattr(self, 'devices_list'):
+                    for device in self.devices_list:
+                        if device['id'] in device_id:  # Handle star marker
+                            self.selected_device = device
+                            self.connect_btn.configure(state="normal")
+                            break
+    
+    def _update_button_states(self):
+        """Update button states based on device connections"""
+        connected_devices = self.multi_device_manager.get_connected_devices()
+        
+        # Enable/disable buttons based on connection state
+        if connected_devices:
+            self.disconnect_all_btn.configure(state="normal")
+        else:
+            self.disconnect_all_btn.configure(state="disabled")
+        
+        # Refresh device control widgets when selection changes
+        self._refresh_device_control_widgets()
     
     def _start_bot(self):
         """Start the bot"""
@@ -213,6 +395,536 @@ class GUIEventHandlers:
                 })
         
         threading.Thread(target=screenshot_thread, daemon=True).start()
+    
+    # Per-device control methods
+    def _start_device_bot(self, device_id):
+        """Start bot for a specific device"""
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
+            return
+        
+        def device_bot_thread():
+            try:
+                # Mark device bot as running
+                if device_id in self.device_control_widgets:
+                    self.device_control_widgets[device_id]['running'] = True
+                
+                self._update_status(f"🤖 Starting bot for {device_id}...")
+                
+                # Update button states
+                self.message_queue.put({
+                    'type': 'device_bot_started',
+                    'device_id': device_id
+                })
+                
+                # Device-specific bot loop
+                while (device_id in self.device_control_widgets and 
+                       self.device_control_widgets[device_id]['running']):
+                    
+                    # Execute bot commands on specific device
+                    try:
+                        # Check if device is still connected
+                        if device_id not in self.multi_device_manager.get_connected_devices():
+                            break
+                        
+                        # Take screenshot from this device
+                        result = self.multi_device_manager.execute_on_device(
+                            device_id, 
+                            'take_screenshot'
+                        )
+                        
+                        if result:
+                            self.screenshot_queue.put(result)
+                        
+                        # Check game status on this device
+                        # Add more device-specific bot logic here
+                        
+                    except Exception as e:
+                        logger.error(f"Error in device bot for {device_id}: {e}")
+                        break
+                    
+                    # Wait for configured interval
+                    time.sleep(self.interval_var.get())
+                
+            except Exception as e:
+                logger.error(f"Error in device bot thread for {device_id}: {e}")
+            finally:
+                # Mark device bot as stopped
+                if device_id in self.device_control_widgets:
+                    self.device_control_widgets[device_id]['running'] = False
+                
+                self.message_queue.put({
+                    'type': 'device_bot_stopped',
+                    'device_id': device_id
+                })
+        
+        threading.Thread(target=device_bot_thread, daemon=True).start()
+    
+    def _stop_device_bot(self, device_id):
+        """Stop bot for a specific device"""
+        if device_id in self.device_control_widgets:
+            self.device_control_widgets[device_id]['running'] = False
+        self._update_status(f"⏹️ Stopping bot for {device_id}...")
+    
+    def _take_device_screenshot(self, device_id):
+        """Take screenshot from a specific device"""
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
+            return
+        
+        def screenshot_thread():
+            try:
+                self._update_status(f"📸 Taking screenshot from {device_id}...")
+                
+                result = self.multi_device_manager.execute_on_device(
+                    device_id, 
+                    'take_screenshot'
+                )
+                
+                if result:
+                    self.screenshot_queue.put(result)
+                    self.message_queue.put({
+                        'type': 'screenshot_taken',
+                        'device_id': device_id
+                    })
+                else:
+                    raise BotError(f"Failed to capture screenshot from {device_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error taking screenshot from {device_id}: {e}")
+                self.message_queue.put({
+                    'type': 'error',
+                    'message': f"Screenshot failed for {device_id}: {e}"
+                })
+        
+        threading.Thread(target=screenshot_thread, daemon=True).start()
+    
+    def _device_tap(self, device_id):
+        """Perform tap gesture at center of device screen"""
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            self.root.after(0, lambda: messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected."))
+            return
+        
+        def tap_thread():
+            try:
+                # Get device session
+                with self.multi_device_manager.lock:
+                    if device_id not in self.multi_device_manager.connected_devices:
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"Device {device_id} session not found"))
+                        return
+                    
+                    session = self.multi_device_manager.connected_devices[device_id]
+                
+                # Get device resolution
+                logger.info(f"Getting screen resolution for device {device_id}")
+                resolution_result = session.adb.execute_adb_command(['shell', 'wm', 'size'])
+                
+                if not resolution_result[0]:
+                    error_msg = f"Failed to get screen resolution for {device_id}"
+                    logger.error(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                    self.root.after(0, lambda: self._update_status(f"❌ {error_msg}"))
+                    return
+                
+                # Parse resolution from output like "Physical size: 1080x1920"
+                resolution_text = resolution_result[1].strip()
+                logger.info(f"Device {device_id} resolution output: {resolution_text}")
+                
+                # Extract width and height from resolution string
+                width, height = None, None
+                if 'Physical size:' in resolution_text:
+                    # Format: "Physical size: 1080x1920"
+                    size_part = resolution_text.split('Physical size:')[1].strip()
+                    if 'x' in size_part:
+                        width, height = map(int, size_part.split('x'))
+                elif 'x' in resolution_text:
+                    # Direct format: "1080x1920"
+                    size_part = resolution_text.split()[0] if ' ' in resolution_text else resolution_text
+                    width, height = map(int, size_part.split('x'))
+                
+                if width is None or height is None:
+                    error_msg = f"Could not parse resolution for {device_id}: {resolution_text}"
+                    logger.error(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                    self.root.after(0, lambda: self._update_status(f"❌ {error_msg}"))
+                    return
+                
+                # Calculate center coordinates
+                center_x = width // 2
+                center_y = height // 2
+                
+                logger.info(f"Device {device_id} - Resolution: {width}x{height}, Center: ({center_x}, {center_y})")
+                
+                # Update status
+                self.root.after(0, lambda: self._update_status(f"👆 Tapping center ({center_x},{center_y}) on {device_id}..."))
+                
+                # Execute tap at center using direct session command
+                tap_result = session.execute_command(['shell', 'input', 'tap', str(center_x), str(center_y)])
+                
+                if tap_result[0]:
+                    success_msg = f"✅ Tapped center ({center_x},{center_y}) on {device_id}"
+                    logger.info(f"Tap successful: {success_msg}")
+                    self.root.after(0, lambda: self._update_status(success_msg))
+                else:
+                    error_msg = f"❌ Tap failed on {device_id}: {tap_result[1]}"
+                    logger.error(error_msg)
+                    self.root.after(0, lambda: self._update_status(error_msg))
+                    self.root.after(0, lambda: messagebox.showerror("Tap Failed", f"Tap command failed on {device_id}:\n{tap_result[1]}"))
+                    
+            except Exception as e:
+                error_msg = f"Error performing tap on {device_id}: {e}"
+                logger.error(error_msg, exc_info=True)
+                self.root.after(0, lambda: self._update_status(f"❌ {error_msg}"))
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        threading.Thread(target=tap_thread, daemon=True).start()
+    
+    def _device_swipe(self, device_id):
+        """Perform swipe gesture on specific device"""
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
+            return
+        
+        # Simple dialog to get swipe coordinates
+        dialog = ctk.CTkInputDialog(text=f"Enter swipe coordinates for {device_id} (x1,y1,x2,y2):", title="Swipe Coordinates")
+        coordinates = dialog.get_input()
+        
+        if coordinates:
+            try:
+                x1, y1, x2, y2 = map(int, coordinates.split(','))
+                
+                def swipe_thread():
+                    try:
+                        result = self.multi_device_manager.execute_on_device(
+                            device_id,
+                            'swipe',
+                            x1=x1, y1=y1, x2=x2, y2=y2
+                        )
+                        
+                        if result:
+                            self._update_status(f"👈 Swiped from ({x1},{y1}) to ({x2},{y2}) on {device_id}")
+                        else:
+                            self._update_status(f"❌ Swipe failed on {device_id}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error performing swipe on {device_id}: {e}")
+                        self._update_status(f"❌ Swipe error on {device_id}: {e}")
+                
+                threading.Thread(target=swipe_thread, daemon=True).start()
+                
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Please enter coordinates in format: x1,y1,x2,y2")
+    
+    def _device_test_actions(self, device_id):
+        """Perform automated test sequence of swipe and tap actions on specific device"""
+        # Immediate feedback - show that button was clicked with device address
+        device_address = str(device_id)
+        print(f"TEST BUTTON CLICKED for device address: {device_address}")
+        logger.info(f"Test button clicked for device address: {device_address}")
+        
+        # Store device_id in a local variable to avoid closure issues
+        dev_id = str(device_id)
+        
+        # Update status immediately - use a simple function call
+        def update_status_safe(msg):
+            try:
+                self._update_status(msg)
+            except Exception as e:
+                logger.error(f"Error updating status: {e}")
+        
+        try:
+            self.root.after(0, lambda: update_status_safe(f"🧪 Test button clicked for device: {dev_id}"))
+        except Exception as e:
+            logger.error(f"Error scheduling status update: {e}")
+        
+        # Start thread to check connection and run test - don't block GUI
+        def check_and_run():
+            try:
+                # Check if device is connected (this might take time, so do in thread)
+                connected_devices = self.multi_device_manager.get_connected_devices()
+                logger.info(f"Connected devices: {list(connected_devices.keys())}")
+                logger.info(f"Testing device address: {dev_id}")
+                logger.info(f"Checking if {dev_id} is in connected devices...")
+                
+                if dev_id not in connected_devices:
+                    logger.warning(f"Device address {dev_id} not found in connected devices")
+                    error_msg = f"Device address {dev_id} is not connected.\n\nConnected devices: {list(connected_devices.keys())}"
+                    self.root.after(0, lambda: messagebox.showwarning("Device Not Connected", error_msg))
+                    self.root.after(0, lambda: update_status_safe(f"❌ Device {dev_id} not connected"))
+                    return
+                
+                logger.info(f"Device address {dev_id} is connected and ready for testing")
+                
+                # Get device session to verify it's using the correct address
+                with self.multi_device_manager.lock:
+                    if dev_id in self.multi_device_manager.connected_devices:
+                        session = self.multi_device_manager.connected_devices[dev_id]
+                        actual_device_id = session.adb.device_id if session.adb.device_id else "NOT SET"
+                        logger.info(f"DeviceSession device_id: {session.device_id}, ADBManager device_id: {actual_device_id}")
+                        
+                        if actual_device_id != dev_id:
+                            logger.warning(f"Device ID mismatch! Expected {dev_id}, ADBManager has {actual_device_id}")
+                            # Try to fix it
+                            if session.adb.connect_to_device(dev_id):
+                                logger.info(f"Fixed ADBManager device_id to {dev_id}")
+                            else:
+                                logger.error(f"Failed to fix ADBManager device_id")
+                
+                # Update status with device address confirmation
+                self.root.after(0, lambda: update_status_safe(f"🧪 Testing device: {dev_id} - Starting test sequence..."))
+                
+                # Define test sequence function
+                def test_sequence():
+                    def safe_update_status(text):
+                        """Thread-safe status update"""
+                        try:
+                            self.root.after(0, lambda t=text: update_status_safe(t))
+                        except Exception as e:
+                            logger.error(f"Error scheduling status update: {e}")
+                    
+                    def take_and_display_screenshot(action_name=""):
+                        """Take screenshot and display it in GUI"""
+                        try:
+                            screenshot = self.multi_device_manager.execute_on_device(
+                                dev_id, 'take_screenshot'
+                            )
+                            if screenshot is not None:
+                                # Put screenshot in queue for GUI display
+                                self.screenshot_queue.put(screenshot)
+                                logger.info(f"Screenshot captured for {action_name} on {dev_id}")
+                                return True
+                            else:
+                                logger.warning(f"Failed to capture screenshot for {action_name}")
+                                return False
+                        except Exception as e:
+                            logger.error(f"Error taking screenshot: {e}")
+                            return False
+                    
+                    try:
+                        safe_update_status(f"🧪 Starting test sequence on device: {dev_id}")
+                        logger.info(f"Test sequence thread started for device address: {dev_id}")
+                        
+                        # Verify device is still connected before starting
+                        connected_devices = self.multi_device_manager.get_connected_devices()
+                        if dev_id not in connected_devices:
+                            error_msg = f"Device {dev_id} disconnected before test could start"
+                            logger.error(error_msg)
+                            safe_update_status(f"❌ {error_msg}")
+                            return
+                        
+                        # Get device session to verify device address
+                        session = None
+                        with self.multi_device_manager.lock:
+                            if dev_id in self.multi_device_manager.connected_devices:
+                                session = self.multi_device_manager.connected_devices[dev_id]
+                                logger.info(f"Using device session for address: {dev_id}")
+                                logger.info(f"Session device_id: {session.device_id}, ADBManager device_id: {session.adb.device_id}")
+                            else:
+                                logger.error(f"Device session not found for {dev_id}")
+                                safe_update_status(f"❌ Device session not found for {dev_id}")
+                                return
+                        
+                        # Helper function to run ADB commands directly (like test_adb_simple.py)
+                        def run_adb_direct(device_id, cmd_parts):
+                            """Run ADB command directly using subprocess (same as test_adb_simple.py)"""
+                            full_cmd = ['adb', '-s', device_id] + cmd_parts
+                            full_cmd_str = ' '.join(full_cmd)
+                            logger.info(f"ACTUAL ADB COMMAND: {full_cmd_str}")
+                            
+                            try:
+                                result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=10)
+                                logger.info(f"ADB command result - returncode={result.returncode}")
+                                if result.stdout:
+                                    logger.info(f"ADB command stdout: {result.stdout.strip()}")
+                                if result.stderr:
+                                    logger.warning(f"ADB command stderr: {result.stderr.strip()}")
+                                
+                                success = result.returncode == 0
+                                output = result.stdout if success else result.stderr
+                                return success, output
+                            except subprocess.TimeoutExpired:
+                                logger.error(f"ADB command timeout: {full_cmd_str}")
+                                return False, "Command timeout"
+                            except Exception as e:
+                                logger.error(f"ADB command exception: {full_cmd_str}, error: {e}")
+                                return False, str(e)
+                        
+                        # Get device resolution first to verify coordinates (using direct subprocess)
+                        try:
+                            safe_update_status(f"📱 Device {dev_id}: Getting resolution...")
+                            resolution_success, resolution_output = run_adb_direct(dev_id, ['shell', 'wm', 'size'])
+                            if resolution_success:
+                                resolution_text = resolution_output.strip()
+                                safe_update_status(f"📱 Device {dev_id} - Resolution: {resolution_text}")
+                                logger.info(f"Device address {dev_id} resolution: {resolution_text}")
+                            else:
+                                logger.warning(f"Could not get device resolution for {dev_id}: {resolution_output}")
+                                safe_update_status(f"⚠️ Device {dev_id}: Could not get resolution")
+                        except Exception as e:
+                            logger.warning(f"Exception getting device resolution for {dev_id}: {e}")
+                        
+                        # Verify ADB connection with test command (using direct subprocess)
+                        try:
+                            safe_update_status(f"🔍 Device {dev_id}: Testing connection...")
+                            test_success, test_output = run_adb_direct(dev_id, ['shell', 'echo', f'Testing device {dev_id}'])
+                            if not test_success:
+                                logger.error(f"Connection test failed for {dev_id}: {test_output}")
+                                safe_update_status(f"❌ Connection test failed for {dev_id}")
+                                return
+                            else:
+                                logger.info(f"Connection test succeeded for {dev_id}")
+                                safe_update_status(f"✅ Device {dev_id}: Connection OK")
+                        except Exception as e:
+                            logger.error(f"Connection test exception for {dev_id}: {e}")
+                            safe_update_status(f"❌ Connection test error for {dev_id}: {e}")
+                            return
+                        
+                        # Take initial screenshot
+                        safe_update_status(f"📸 Device {dev_id}: Taking initial screenshot...")
+                        take_and_display_screenshot("initial")
+                        time.sleep(0.5)
+                        
+                        # 1. Tap center of screen (using direct subprocess like test_adb_simple.py)
+                        logger.info(f"Testing tap at center (540, 960) on device address: {dev_id}")
+                        safe_update_status(f"👆 Device {dev_id}: Tapping center (540,960)...")
+                        time.sleep(1)  # Wait like test_adb_simple.py
+                        try:
+                            center_tap_success, center_tap_output = run_adb_direct(dev_id, ['shell', 'input', 'tap', '540', '960'])
+                            
+                            if center_tap_success:
+                                logger.info(f"[OK] Tap command executed successfully on {dev_id}!")
+                                safe_update_status(f"✅ Device {dev_id}: Tap executed at center (540,960) - Check device screen!")
+                            else:
+                                logger.error(f"[FAIL] Tap command failed on {dev_id}: {center_tap_output}")
+                                safe_update_status(f"❌ Device {dev_id}: Tap failed - {center_tap_output}")
+                            
+                            # Wait a bit for device to respond, then take screenshot
+                            time.sleep(0.8)
+                            if take_and_display_screenshot("after center tap"):
+                                if center_tap_success:
+                                    safe_update_status(f"✅ Device {dev_id}: Tap executed - Check screenshot!")
+                                else:
+                                    safe_update_status(f"⚠️ Device {dev_id}: Tap may have failed - Check screenshot!")
+                        except Exception as e:
+                            logger.error(f"Exception during tap on device {dev_id}: {e}", exc_info=True)
+                            safe_update_status(f"❌ Device {dev_id}: Test tap exception - {e}")
+                        
+                        time.sleep(0.5)
+                        
+                        # 2. Test tap at alternative center (960, 540) - for different resolution (like test_adb_simple.py)
+                        logger.info(f"Testing tap at alternative center (960, 540) - adjusted for 1920x1080 on device {dev_id}")
+                        safe_update_status(f"👆 Device {dev_id}: Tapping alternative center (960,540)...")
+                        time.sleep(2)  # Wait like test_adb_simple.py
+                        try:
+                            alt_tap_success, alt_tap_output = run_adb_direct(dev_id, ['shell', 'input', 'tap', '960', '540'])
+                            
+                            if alt_tap_success:
+                                logger.info(f"[OK] Alternative tap executed successfully on {dev_id}!")
+                                safe_update_status(f"✅ Device {dev_id}: Alternative tap executed (960,540) - Check device screen!")
+                            else:
+                                logger.error(f"[FAIL] Alternative tap failed on {dev_id}: {alt_tap_output}")
+                            
+                            time.sleep(0.8)
+                            if take_and_display_screenshot("after alternative tap"):
+                                if alt_tap_success:
+                                    safe_update_status(f"✅ Device {dev_id}: Alternative tap executed - Check screenshot!")
+                        except Exception as e:
+                            logger.error(f"Exception during alternative tap on device {dev_id}: {e}", exc_info=True)
+                            safe_update_status(f"❌ Device {dev_id}: Alternative tap exception - {e}")
+                        
+                        time.sleep(0.5)
+                        
+                        # 3. Test swipe (using direct subprocess like test_adb_simple.py)
+                        logger.info(f"Testing swipe on device {dev_id}")
+                        safe_update_status(f"👈 Device {dev_id}: Swiping...")
+                        time.sleep(1)  # Wait like test_adb_simple.py
+                        try:
+                            swipe_success, swipe_output = run_adb_direct(dev_id, ['shell', 'input', 'swipe', '300', '540', '700', '540', '300'])
+                            
+                            if swipe_success:
+                                logger.info(f"[OK] Swipe executed successfully on {dev_id}!")
+                                safe_update_status(f"✅ Device {dev_id}: Swipe executed - Check device screen!")
+                            else:
+                                logger.error(f"[FAIL] Swipe failed on {dev_id}: {swipe_output}")
+                                safe_update_status(f"❌ Device {dev_id}: Swipe failed - {swipe_output}")
+                            
+                            time.sleep(0.8)
+                            if take_and_display_screenshot("after swipe"):
+                                if swipe_success:
+                                    safe_update_status(f"✅ Device {dev_id}: Swipe executed - Check screenshot!")
+                        except Exception as e:
+                            logger.error(f"Exception during swipe on device {dev_id}: {e}", exc_info=True)
+                            safe_update_status(f"❌ Device {dev_id}: Swipe exception - {e}")
+                        
+                        
+                        # Final screenshot
+                        time.sleep(0.5)
+                        safe_update_status(f"📸 Device {dev_id}: Taking final screenshot...")
+                        take_and_display_screenshot("final")
+                        
+                        # Final status
+                        safe_update_status(f"🎯 Device {dev_id}: Test sequence completed! Check Monitor tab for screenshots")
+                        logger.info(f"Test sequence completed successfully on device address: {dev_id}")
+                        logger.info("="*60)
+                        logger.info("Test completed!")
+                        logger.info("="*60)
+                        logger.info("NOTE: If taps don't appear on screen:")
+                        logger.info("1. Make sure screen is unlocked")
+                        logger.info("2. Check if app is in foreground")
+                        logger.info("3. Verify coordinates match device resolution")
+                        logger.info("4. Try different coordinates")
+                        
+                    except Exception as e:
+                        logger.error(f"Error during test sequence on {dev_id}: {e}", exc_info=True)
+                        safe_update_status(f"❌ Test sequence error on {dev_id}: {e}")
+                        error_msg = f"Test sequence failed on {dev_id}:\n{e}"
+                        self.root.after(0, lambda: messagebox.showerror("Test Error", error_msg))
+                
+                # Run test sequence in background thread
+                logger.info(f"Creating test sequence thread for {dev_id}...")
+                thread = threading.Thread(target=test_sequence, daemon=True, name=f"TestSequence-{dev_id}")
+                thread.start()
+                logger.info(f"Test sequence thread started for {dev_id}")
+                
+            except Exception as e:
+                logger.error(f"Error in check_and_run for {dev_id}: {e}", exc_info=True)
+                self.root.after(0, lambda: update_status_safe(f"❌ Error: {e}"))
+                self.root.after(0, lambda: messagebox.showerror("Test Error", f"Error starting test: {e}"))
+        
+        # Start the check_and_run in a thread to avoid blocking GUI
+        try:
+            check_thread = threading.Thread(target=check_and_run, daemon=True, name=f"CheckAndRun-{dev_id}")
+            check_thread.start()
+        except Exception as e:
+            logger.error(f"Error starting check thread: {e}", exc_info=True)
+            self.root.after(0, lambda: update_status_safe(f"❌ Failed to start test: {e}"))
+            self.root.after(0, lambda: messagebox.showerror("Test Error", f"Failed to start test thread: {e}"))
+    
+    # Global control methods
+    def _start_all_bots(self):
+        """Start bots for all selected devices"""
+        selected_devices = self._get_selected_devices_from_tree()
+        connected_devices = self.multi_device_manager.get_connected_devices()
+        
+        for device in selected_devices:
+            device_id = device['id']
+            if device_id in connected_devices:
+                self._start_device_bot(device_id)
+    
+    def _stop_all_bots(self):
+        """Stop bots for all selected devices"""
+        for device_id in list(self.device_control_widgets.keys()):
+            self._stop_device_bot(device_id)
+    
+    def _take_screenshot_all(self):
+        """Take screenshots from all selected devices"""
+        selected_devices = self._get_selected_devices_from_tree()
+        connected_devices = self.multi_device_manager.get_connected_devices()
+        
+        for device in selected_devices:
+            device_id = device['id']
+            if device_id in connected_devices:
+                self._take_device_screenshot(device_id)
     
     def _update_interval_label(self, value):
         """Update the interval label when slider changes"""
@@ -420,8 +1132,52 @@ For support and documentation, visit the project repository."""
         msg_type = message.get('type')
         
         if msg_type == 'devices_discovered':
+            device_status = message.get('device_status', {})
             self._update_device_list(message['devices'])
-            self._update_status(f"✅ Found {len(message['devices'])} device(s)")
+            
+            # Include device limit info in status
+            connected_count = device_status.get('connected_count', 0)
+            max_devices = device_status.get('max_devices', 0)
+            status_text = f"✅ Found {len(message['devices'])} device(s)"
+            if max_devices > 0:
+                status_text += f" (Connected: {connected_count}/{max_devices})"
+            
+            self._update_status(status_text)
+            self._update_button_states()
+            
+        elif msg_type == 'devices_discovered_and_connected':
+            devices = message['devices']
+            connected_count = message['connected_count']
+            device_status = message.get('device_status', {})
+            max_devices = device_status.get('max_devices', 0)
+            
+            self._update_device_list(devices)
+            
+            # Auto-select (check) connected devices in the device tree
+            connected_devices = self.multi_device_manager.get_connected_devices()
+            self._auto_select_connected_devices(connected_devices)
+            
+            # Enhanced status with device limits
+            status_text = f"✅ Discovered {len(devices)} device(s), auto-connected to {connected_count} game-ready devices"
+            if max_devices > 0:
+                status_text += f" (Limit: {max_devices})"
+            
+            self._update_status(status_text)
+            
+            # Update connection status with limit info
+            connection_text = f"🎮 Auto-connected: {connected_count}"
+            if max_devices > 0:
+                connection_text += f"/{max_devices}"
+            connection_text += " game devices"
+            
+            self.connection_status.configure(text=connection_text)
+            
+            # Refresh connection display and update buttons
+            self._refresh_device_connections()
+            self._update_button_states()
+            
+            # Refresh per-device control widgets after auto-selection
+            self._refresh_device_control_widgets()
             
         elif msg_type == 'device_connected':
             device = message['device']
@@ -431,6 +1187,34 @@ For support and documentation, visit the project repository."""
             # Enable bot controls
             self.start_bot_btn.configure(state="normal")
             self.screenshot_btn.configure(state="normal")
+            
+        elif msg_type == 'multi_devices_connected':
+            connected_count = message['connected_count']
+            failed_devices = message.get('failed_devices', [])
+            
+            if failed_devices:
+                status_text = f"✅ Connected to {connected_count} devices, {len(failed_devices)} failed"
+            else:
+                status_text = f"✅ Connected to {connected_count} devices"
+            
+            self._update_status(status_text)
+            self.connection_status.configure(text=f"🟢 Multi-device: {connected_count} connected")
+            
+            # Update device tree to show connection status
+            self._refresh_device_connections()
+            self._update_button_states()
+            
+            # Refresh device control widgets
+            self._refresh_device_control_widgets()
+            
+        elif msg_type == 'all_devices_disconnected':
+            self._update_status("🚫 Disconnected from all devices")
+            self.connection_status.configure(text="🔴 Not connected")
+            self._refresh_device_connections()
+            self._update_button_states()
+            
+            # Refresh device control widgets
+            self._refresh_device_control_widgets()
             
         elif msg_type == 'bot_started':
             self.start_bot_btn.configure(state="disabled")
@@ -445,7 +1229,27 @@ For support and documentation, visit the project repository."""
             self._update_game_status(message)
             
         elif msg_type == 'screenshot_taken':
-            self._update_status("📸 Screenshot captured")
+            device_id = message.get('device_id')
+            if device_id:
+                self._update_status(f"📸 Screenshot captured from {device_id}")
+            else:
+                self._update_status("📸 Screenshot captured")
+            
+        elif msg_type == 'device_bot_started':
+            device_id = message['device_id']
+            if device_id in self.device_control_widgets:
+                widgets = self.device_control_widgets[device_id]
+                widgets['start_btn'].configure(state="disabled")
+                widgets['stop_btn'].configure(state="normal")
+            self._update_status(f"🤖 Bot started for {device_id}")
+            
+        elif msg_type == 'device_bot_stopped':
+            device_id = message['device_id']
+            if device_id in self.device_control_widgets:
+                widgets = self.device_control_widgets[device_id]
+                widgets['start_btn'].configure(state="normal")
+                widgets['stop_btn'].configure(state="disabled")
+            self._update_status(f"⏹️ Bot stopped for {device_id}")
             
         elif msg_type == 'test_results':
             self._show_test_results(message['results'])
@@ -460,34 +1264,102 @@ For support and documentation, visit the project repository."""
         for item in self.device_tree.get_children():
             self.device_tree.delete(item)
         
-        # Add devices
+        # Deduplicate devices by device_id before processing
+        seen_device_ids = set()
+        unique_devices = []
         for device in devices:
-            status_icon = "🟢" if device['status'] == 'connected' else "🟡"
-            
-            # Game status information
+            device_id = device['id']
+            if device_id not in seen_device_ids:
+                seen_device_ids.add(device_id)
+                unique_devices.append(device)
+            else:
+                logger.warning(f"Duplicate device found in devices list: {device_id}, skipping")
+        
+        # Separate and prioritize devices with games
+        game_devices = []
+        regular_devices = []
+        
+        for device in unique_devices:
             game_status = device.get('game_status', {})
-            game_info = "Not installed"
-            
+            if game_status.get('installed') or game_status.get('running'):
+                game_devices.append(device)
+            else:
+                regular_devices.append(device)
+        
+        # Add game devices first (prioritized)
+        for device in game_devices:
+            self._add_device_to_tree(device, is_game_device=True)
+        
+        # Then add regular devices
+        for device in regular_devices:
+            self._add_device_to_tree(device, is_game_device=False)
+    
+    def _add_device_to_tree(self, device, is_game_device=False):
+        """Add a device to the tree view with multi-device support"""
+        game_status = device.get('game_status', {})
+        device_id = device['id']
+        
+        # Check if this device already exists in the tree (prevent duplicates)
+        for item in self.device_tree.get_children():
+            existing_device_id = self.device_tree.item(item, "text").replace(" ⭐", "")
+            if existing_device_id == device_id:
+                logger.warning(f"Device {device_id} already exists in tree, skipping duplicate")
+                return
+        
+        # Check if device is connected in multi-device manager
+        connected_devices = self.multi_device_manager.get_connected_devices()
+        is_connected_multi = device_id in connected_devices
+        connection_status = "🟢 Connected" if is_connected_multi else "🔴 Disconnected"
+        
+        # Determine device status and icon
+        if is_game_device:
+            # Game devices are automatically marked as "available" for bot use
             if game_status.get('running'):
-                running_count = len(game_status.get('running_packages', []))
-                game_info = f"🎮 Running ({running_count})"
+                status_icon = "🎮"
+                device_status = "available"
             elif game_status.get('installed'):
-                installed_count = len(game_status.get('installed_packages', []))
-                game_info = f"📱 Installed ({installed_count})"
-            
-            self.device_tree.insert(
-                "",
-                "end",
-                text=device['id'],
-                values=(
-                    device.get('type', 'Unknown'),
-                    device.get('model', 'Unknown'),
-                    device.get('android_version', 'Unknown'),
-                    device.get('resolution', 'Unknown'),
-                    f"{status_icon} {device['status']}",
-                    game_info
-                )
+                status_icon = "📱"  
+                device_status = "available"
+            else:
+                status_icon = "🟢" if device['status'] == 'connected' else "🟡"
+                device_status = "available" if device['status'] in ['connected', 'available'] else "unavailable"
+        else:
+            # Regular devices - show available/unavailable based on connection status
+            status_icon = "🟢" if device['status'] == 'connected' else "🟡"
+            device_status = "available" if device['status'] in ['connected', 'available'] else "unavailable"
+        
+        # Game status information
+        game_info = "Not installed"
+        if game_status.get('running'):
+            running_count = len(game_status.get('running_packages', []))
+            game_info = f"🎮 Running ({running_count})"
+        elif game_status.get('installed'):
+            installed_count = len(game_status.get('installed_packages', []))
+            game_info = f"📱 Installed ({installed_count})"
+        
+        # Add priority indicator for game devices
+        display_device_id = device_id
+        if is_game_device:
+            display_device_id += " ⭐"
+        
+        # Default checkbox state
+        checkbox_state = "☐"
+        
+        self.device_tree.insert(
+            "",
+            "end",
+            text=display_device_id,
+            values=(
+                checkbox_state,  # Checkbox
+                device.get('type', 'Unknown'),
+                device.get('model', 'Unknown'),
+                device.get('android_version', 'Unknown'),
+                device.get('resolution', 'Unknown'),
+                f"{status_icon} {device_status}",
+                game_info,
+                connection_status
             )
+        )
     
     def _update_game_status(self, message):
         """Update the game status display"""
@@ -610,6 +1482,3 @@ For support and documentation, visit the project repository."""
             self.progress_bar.pack_forget()
         except Exception as e:
             logger.error(f"Error hiding progress: {e}")
-
-# Import time module for the handlers
-import time
