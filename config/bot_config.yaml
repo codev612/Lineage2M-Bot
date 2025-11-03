@@ -1,0 +1,47 @@
+adb:
+  connection_retry_count: 3
+  connection_retry_delay: 2.0
+  screenshot_timeout: 10
+  timeout: 30
+auto_select_single_device: true
+bluestacks:
+  auto_discover: true
+  connection_timeout: 15
+  ports:
+  - 5555
+  - 5554
+  - 5556
+  - 5558
+  - 5562
+  - 5564
+  - 5566
+  - 5568
+game:
+  auto_launch: false
+  detection_interval: 5.0
+  packages:
+  - com.ncsoft.lineage2m
+  - com.ncsoft.lineage2m.android
+  - com.ncsoft.lineage2m.global
+  - com.ncsoft.lineage2m.sea
+  - com.ncsoft.lineage2m.kr
+image_recognition:
+  confidence_threshold: 0.8
+  ocr_enabled: true
+  ocr_language: eng
+  template_matching_method: cv2.TM_CCOEFF_NORMED
+logging:
+  backup_count: 5
+  console_enabled: true
+  detailed_format: false
+  file_enabled: true
+  level: INFO
+  max_file_size: 10485760
+save_screenshots: true
+screenshot_directory: screenshots
+touch:
+  coordinate_scaling: true
+  drag_duration: 1.0
+  swipe_duration: 0.5
+  tap_duration: 0.1
+  validation_enabled: true

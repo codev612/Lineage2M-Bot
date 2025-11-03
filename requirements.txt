@@ -1,0 +1,14 @@
+# Core dependencies
+adb-shell==0.4.4
+opencv-python==4.8.1.78
+numpy==1.24.3
+pillow==10.0.1
+psutil==5.9.5
+
+# Configuration and utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Optional dependencies for advanced features
+# pytesseract>=0.3.10  # For OCR functionality
+# mss>=7.0.1          # For faster screenshots
