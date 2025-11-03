@@ -417,36 +417,57 @@ class ADBManager:
         try:
             target_device = device_id or self.device_id
             
-            # Check installed packages
-            installed_packages = self.get_installed_packages(target_device, game_packages)
-            game_status['installed_packages'] = installed_packages
-            game_status['game_installed'] = len(installed_packages) > 0
+            if not target_device:
+                logger.debug("No target device specified for game status check")
+                return game_status
+            
+            # Check installed packages with device-specific commands
+            for package in game_packages:
+                try:
+                    cmd = ['-s', target_device, 'shell', 'pm', 'list', 'packages', package]
+                    success, output = self.execute_adb_command(cmd)
+                    
+                    if success and package in output:
+                        game_status['installed_packages'].append(package)
+                except Exception as e:
+                    logger.debug(f"Error checking package {package} on {target_device}: {e}")
+                    continue
+            
+            game_status['game_installed'] = len(game_status['installed_packages']) > 0
             
             # Check running packages
-            for package in installed_packages:
-                if target_device:
+            for package in game_status['installed_packages']:
+                try:
                     cmd = ['-s', target_device, 'shell', 'pidof', package]
-                else:
-                    cmd = ['shell', 'pidof', package]
-                
-                success, output = self.execute_adb_command(cmd)
-                if success and output.strip():
-                    game_status['running_packages'].append(package)
+                    success, output = self.execute_adb_command(cmd)
+                    
+                    if success and output.strip():
+                        game_status['running_packages'].append(package)
+                except Exception as e:
+                    logger.debug(f"Error checking running process {package}: {e}")
+                    continue
             
             game_status['game_running'] = len(game_status['running_packages']) > 0
             
-            # Check foreground app
-            if target_device:
-                # Temporarily set device_id for foreground app check
-                original_device = self.device_id
-                self.device_id = target_device
-                foreground_app = self.get_foreground_app()
-                self.device_id = original_device
-            else:
-                foreground_app = self.get_foreground_app()
-            
-            if foreground_app in game_packages:
-                game_status['foreground_package'] = foreground_app
+            # Check foreground app with device-specific command
+            try:
+                cmd = ['-s', target_device, 'shell', 'dumpsys', 'activity', 'activities']
+                success, output = self.execute_adb_command(cmd)
+                
+                if success and output:
+                    lines = output.split('\n')
+                    for line in lines:
+                        if 'mResumedActivity' in line or 'mCurrentFocus' in line:
+                            # Extract package name
+                            import re
+                            match = re.search(r'([a-zA-Z0-9._]+)/[a-zA-Z0-9._]+', line)
+                            if match:
+                                foreground_package = match.group(1)
+                                if foreground_package in game_packages:
+                                    game_status['foreground_package'] = foreground_package
+                                break
+            except Exception as e:
+                logger.debug(f"Error checking foreground app: {e}")
                 
         except Exception as e:
             logger.error(f"Error checking game status: {e}")

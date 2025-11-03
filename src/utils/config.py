@@ -270,6 +270,12 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"Error saving configuration: {e}")
             raise ConfigurationError(f"Failed to save configuration: {e}")
+    
+    def reload_config(self) -> None:
+        """Force reload configuration from file"""
+        logger.info("Force reloading configuration")
+        self.config = None
+        self._load_config()
 
 # Global configuration manager instance
 config_manager = ConfigManager()

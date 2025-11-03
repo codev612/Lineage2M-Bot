@@ -54,6 +54,11 @@ class DeviceManager:
             logger.debug(f"Checking game status for device: {device_id}")
             
             try:
+                # Ensure device is properly connected before checking game status
+                if device.get('status') == 'connected':
+                    # For connected devices, ensure ADB manager has proper connection
+                    self.adb.connect_to_device(device_id)
+                
                 # Check game status on device
                 game_status = self.adb.check_game_status(device_id, game_packages)
                 
@@ -65,6 +70,11 @@ class DeviceManager:
                     'running_packages': game_status['running_packages'],
                     'foreground_package': game_status['foreground_package']
                 }
+                
+                # Debug: Log the mapping
+                logger.debug(f"Device {device_id} game status mapping:")
+                logger.debug(f"  Raw: {game_status}")
+                logger.debug(f"  Mapped: {device['game_status']}")
                 
                 # Update device status if game is running
                 if game_status['game_running']:
@@ -109,9 +119,13 @@ class DeviceManager:
                         break
                 
                 if existing_device:
-                    # Update existing device with game-ready status
+                    # Update existing device with game-ready status, but preserve enhanced game_status
+                    preserved_game_status = existing_device.get('game_status', {})
                     existing_device.update(game_device)
                     existing_device['game_ready'] = True
+                    # Restore the properly mapped game_status if it was better
+                    if preserved_game_status.get('installed') is not None:
+                        existing_device['game_status'] = preserved_game_status
                 else:
                     # Add new game-ready device
                     game_device['game_ready'] = True

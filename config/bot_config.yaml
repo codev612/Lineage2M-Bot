@@ -21,10 +21,8 @@ game:
   detection_interval: 5.0
   packages:
   - com.ncsoft.lineage2m
-  - com.ncsoft.lineage2m.android
   - com.ncsoft.lineage2m.global
-  - com.ncsoft.lineage2m.sea
-  - com.ncsoft.lineage2m.kr
+  - com.ncsoft.lineage2mnu
 image_recognition:
   confidence_threshold: 0.8
   ocr_enabled: true
