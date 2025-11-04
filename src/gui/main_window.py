@@ -65,6 +65,9 @@ class MainWindow(GUIEventHandlers):
         self._setup_menu()
         self._start_update_thread()
         
+        # Restore saved devices on startup
+        self._restore_saved_devices()
+        
         logger.info("GUI initialized successfully")
     
     def _setup_gui(self):
@@ -141,21 +144,13 @@ class MainWindow(GUIEventHandlers):
         button_frame = ctk.CTkFrame(header_frame)
         button_frame.pack(side="right", padx=10, pady=5)
         
-        self.discover_btn = ctk.CTkButton(
+        self.add_device_btn = ctk.CTkButton(
             button_frame,
-            text="🔍 Discover",
-            command=self._discover_devices,
-            width=100
+            text="➕ Add Device",
+            command=self._add_device_manually,
+            width=110
         )
-        self.discover_btn.pack(side="left", padx=2, pady=5)
-        
-        self.refresh_btn = ctk.CTkButton(
-            button_frame,
-            text="🔄 Refresh",
-            command=self._refresh_devices,
-            width=80
-        )
-        self.refresh_btn.pack(side="left", padx=2, pady=5)
+        self.add_device_btn.pack(side="left", padx=2, pady=5)
         
         # Multi-device control buttons
         self.select_all_btn = ctk.CTkButton(

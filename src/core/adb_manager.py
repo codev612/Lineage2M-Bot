@@ -439,10 +439,10 @@ class ADBManager:
                 logger.debug("No target device specified for game status check")
                 return game_status
             
-            # Check installed packages with device-specific commands
+            # Check installed packages - execute_adb_command already adds device ID
             for package in game_packages:
                 try:
-                    cmd = ['-s', target_device, 'shell', 'pm', 'list', 'packages', package]
+                    cmd = ['shell', 'pm', 'list', 'packages', package]
                     success, output = self.execute_adb_command(cmd)
                     
                     if success and package in output:
@@ -453,10 +453,10 @@ class ADBManager:
             
             game_status['game_installed'] = len(game_status['installed_packages']) > 0
             
-            # Check running packages
+            # Check running packages - execute_adb_command already adds device ID
             for package in game_status['installed_packages']:
                 try:
-                    cmd = ['-s', target_device, 'shell', 'pidof', package]
+                    cmd = ['shell', 'pidof', package]
                     success, output = self.execute_adb_command(cmd)
                     
                     if success and output.strip():
@@ -467,9 +467,9 @@ class ADBManager:
             
             game_status['game_running'] = len(game_status['running_packages']) > 0
             
-            # Check foreground app with device-specific command
+            # Check foreground app - execute_adb_command already adds device ID
             try:
-                cmd = ['-s', target_device, 'shell', 'dumpsys', 'activity', 'activities']
+                cmd = ['shell', 'dumpsys', 'activity', 'activities']
                 success, output = self.execute_adb_command(cmd)
                 
                 if success and output:

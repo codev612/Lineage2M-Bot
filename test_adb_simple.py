@@ -24,7 +24,19 @@ def run_adb(device_id, cmd_parts):
         return False
 
 def main():
-    device_id = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:5555"
+    # Get device ID manually - either from command line or prompt user
+    if len(sys.argv) > 1:
+        device_id = sys.argv[1]
+    else:
+        print("="*60)
+        print("ADB Direct Tap Test")
+        print("="*60)
+        print("\nPlease enter device ID manually:")
+        print("Example: 127.0.0.1:5555 or emulator-5554")
+        device_id = input("Device ID: ").strip()
+        if not device_id:
+            print("Error: Device ID is required!")
+            sys.exit(1)
     
     print("="*60)
     print("ADB Direct Tap Test")
