@@ -230,24 +230,215 @@ class GameDetector:
             True if launch command executed successfully
         """
         try:
-            target_package = package_name or self.lineage2m_packages[0]
+            # If no package specified, try to find installed packages first
+            if not package_name:
+                installed = self.get_installed_lineage2m_packages()
+                if installed:
+                    target_package = installed[0]
+                    logger.info(f"No package specified, using first installed: {target_package}")
+                else:
+                    target_package = self.lineage2m_packages[0]
+                    logger.warning(f"No installed packages found, trying default: {target_package}")
+            else:
+                target_package = package_name
             
-            logger.info(f"Launching Lineage 2M: {target_package}")
+            logger.info(f"Attempting to launch Lineage 2M: {target_package}")
             
+            # Verify package is installed first (must use exact match)
+            # pm list packages <name> does partial matching, so we need to check all packages
             success, output = self.adb.execute_adb_command([
-                'shell', 'monkey', '-p', target_package, '-c', 
-                'android.intent.category.LAUNCHER', '1'
+                'shell', 'pm', 'list', 'packages'
             ])
             
-            if success:
-                logger.info(f"Launch command executed for {target_package}")
-                return True
-            else:
-                logger.error(f"Failed to launch {target_package}: {output}")
+            if not success:
+                logger.error(f"Failed to list packages")
                 return False
+            
+            # Check for exact package match (package:com.ncsoft.lineage2mnu)
+            exact_match = f"package:{target_package}" in output
+            if not exact_match:
+                # Try to find the actual installed package (might be a variant)
+                import re
+                pattern = re.compile(rf'package:({re.escape(target_package)}[^\s]*)')
+                matches = pattern.findall(output)
+                if matches:
+                    actual_package = matches[0]
+                    logger.warning(f"Package {target_package} not found, but found similar package: {actual_package}")
+                    logger.info(f"Using actual installed package: {actual_package}")
+                    target_package = actual_package
+                else:
+                    logger.error(f"Package {target_package} is not installed (exact match)")
+                    return False
+            
+            logger.info(f"Package {target_package} is installed, proceeding with launch")
+            
+            # Method 1: Try simple monkey command first (most reliable for most apps)
+            try:
+                logger.info(f"Trying simple monkey command: {target_package}")
+                success, output = self.adb.execute_adb_command([
+                    'shell', 'monkey', '-p', target_package, '1'
+                ])
+                
+                if success:
+                    logger.info(f"Game launched successfully using simple monkey: {target_package}")
+                    logger.info(f"Command output: {output}")
+                    return True
+                else:
+                    logger.warning(f"Simple monkey command failed: {output}")
+            except Exception as e:
+                logger.warning(f"Simple monkey command exception: {e}")
+            
+            # Method 2: Try to get launcher activity from dumpsys window (current focused app)
+            try:
+                # Get current window to find launcher activity pattern
+                success, output = self.adb.execute_adb_command([
+                    'shell', 'dumpsys', 'window', 'windows'
+                ])
+                
+                if success and output:
+                    import re
+                    # Look for activity pattern like: package/activity
+                    activity_pattern = re.search(rf'{re.escape(target_package)}/([a-zA-Z0-9._]+Activity)', output)
+                    if activity_pattern:
+                        activity = f"{target_package}/{activity_pattern.group(1)}"
+                        logger.info(f"Found activity from window dump: {activity}")
+                        
+                        # Try launching with this activity
+                        success, output = self.adb.execute_adb_command([
+                            'shell', 'am', 'start', '-n', activity
+                        ])
+                        
+                        if success:
+                            logger.info(f"Game launched successfully using am start with activity: {activity}")
+                            return True
+            except Exception as e:
+                logger.debug(f"Could not get activity from window dump: {e}")
+            
+            # Method 3: Try am start with main activity (get from dumpsys package)
+            try:
+                # Get launcher activity using dumpsys package
+                success, output = self.adb.execute_adb_command([
+                    'shell', 'dumpsys', 'package', target_package
+                ])
+                
+                if success and output:
+                    # Try to extract launcher activity from package dump
+                    import re
+                    # Look for activity with MAIN/LAUNCHER intent filter
+                    # Pattern: Activity name with MAIN action and LAUNCHER category
+                    patterns = [
+                        r'([a-zA-Z0-9._]+\.[a-zA-Z0-9._]+Activity)\s+\w+ filter.*?android\.intent\.action\.MAIN',
+                        r'Activity.*?([a-zA-Z0-9._]+\.[a-zA-Z0-9._]+Activity).*?MAIN.*?LAUNCHER',
+                        r'([a-zA-Z0-9._]+/[a-zA-Z0-9._]+Activity).*?MAIN.*?LAUNCHER'
+                    ]
+                    
+                    activity = None
+                    for pattern in patterns:
+                        match = re.search(pattern, output, re.DOTALL)
+                        if match:
+                            activity = match.group(1)
+                            # If activity doesn't have package prefix, add it
+                            if not activity.startswith(target_package):
+                                if '/' not in activity:
+                                    activity = f"{target_package}/{activity}"
+                            break
+                    
+                    if activity:
+                        logger.info(f"Found launcher activity: {activity}")
+                        
+                        # Launch using am start
+                        success, output = self.adb.execute_adb_command([
+                            'shell', 'am', 'start', '-n', activity
+                        ])
+                        
+                        if success:
+                            logger.info(f"Game launched successfully using am start: {target_package}")
+                            return True
+                        else:
+                            logger.debug(f"am start with activity {activity} failed: {output}")
+            except Exception as e:
+                logger.debug(f"Could not get main activity: {e}")
+            
+            # Method 4: Try common activity names (especially for Unity/Unreal games like Lineage 2M)
+            common_activities = [
+                'com.epicgames.ue4.GameActivity',  # Unreal Engine games (Lineage 2M uses this!)
+                'com.unity3d.player.UnityPlayerActivity',  # Unity games
+                'MainActivity', 
+                'SplashActivity', 
+                'UnityPlayerActivity', 
+                'GameActivity'
+            ]
+            for activity_name in common_activities:
+                try:
+                    # Handle both full activity paths and simple names
+                    if activity_name.startswith('com.'):
+                        # Full activity path - use as package/activity
+                        activity = f'{target_package}/{activity_name}'
+                    else:
+                        # Simple name - prepend package
+                        activity = f'{target_package}/{activity_name}'
+                    
+                    logger.info(f"Trying activity: {activity}")
+                    success, output = self.adb.execute_adb_command([
+                        'shell', 'am', 'start', '-n', activity
+                    ])
+                    
+                    if success:
+                        logger.info(f"Game launched successfully using activity {activity}: {target_package}")
+                        logger.info(f"Command output: {output}")
+                        # Even if warning says "already running", command succeeded
+                        return True
+                    else:
+                        logger.debug(f"am start with {activity_name} failed: {output}")
+                except Exception as e:
+                    logger.debug(f"am start with {activity_name} exception: {e}")
+                    continue
+            
+            # Method 5: Try am start with package intent (works if package has default launcher)
+            try:
+                logger.info(f"Trying am start with package intent: {target_package}")
+                success, output = self.adb.execute_adb_command([
+                    'shell', 'am', 'start', '-a', 'android.intent.action.MAIN',
+                    '-c', 'android.intent.category.LAUNCHER',
+                    target_package
+                ])
+                
+                if success and 'Error' not in output:
+                    logger.info(f"Game launched successfully using am start with package: {target_package}")
+                    logger.info(f"Command output: {output}")
+                    return True
+                else:
+                    logger.warning(f"am start with package failed: {output}")
+            except Exception as e:
+                logger.warning(f"am start with package exception: {e}")
+            
+            # Method 6: Try monkey with category (last resort)
+            try:
+                logger.info(f"Trying monkey with category: {target_package}")
+                success, output = self.adb.execute_adb_command([
+                    'shell', 'monkey', '-p', target_package, 
+                    '-c', 'android.intent.category.LAUNCHER', '1'
+                ])
+                
+                if success:
+                    logger.info(f"Game launched successfully using monkey with category: {target_package}")
+                    logger.info(f"Command output: {output}")
+                    return True
+                else:
+                    logger.warning(f"Monkey with category failed: {output}")
+            except Exception as e:
+                logger.warning(f"Monkey with category exception: {e}")
+            
+            # All methods failed - log detailed error
+            logger.error(f"All launch methods failed for {target_package}")
+            logger.error(f"Please check:")
+            logger.error(f"  1. Package {target_package} is installed: adb shell pm list packages {target_package}")
+            logger.error(f"  2. Try manually: adb shell am start -n {target_package}/.MainActivity")
+            logger.error(f"  3. Or try: adb shell monkey -p {target_package} 1")
+            return False
                 
         except Exception as e:
-            logger.error(f"Error launching game: {e}")
+            logger.error(f"Error launching game: {e}", exc_info=True)
             return False
     
     def close_game(self, package_name: str = None) -> bool:
@@ -317,20 +508,60 @@ class GameDetector:
         Get list of installed Lineage 2M packages
         
         Returns:
-            List of installed package names
+            List of installed package names (exact matches only)
         """
         try:
             installed_packages = []
             
-            for package in self.lineage2m_packages:
-                success, output = self.adb.execute_adb_command([
-                    'shell', 'pm', 'list', 'packages', package
-                ])
-                
-                if success and package in output:
-                    installed_packages.append(package)
+            # Get all packages first to check for exact matches
+            success, all_packages_output = self.adb.execute_adb_command([
+                'shell', 'pm', 'list', 'packages'
+            ])
             
-            logger.info(f"Found {len(installed_packages)} installed Lineage 2M packages")
+            if not success:
+                logger.error("Failed to list all packages")
+                return []
+            
+            # Check known packages for EXACT matches only
+            # IMPORTANT: We need to check for exact package:package_name format
+            # Split by newlines and check each line to avoid partial matches
+            package_lines = all_packages_output.split('\n')
+            for package in self.lineage2m_packages:
+                # Check for exact match in format "package:com.ncsoft.lineage2m\n" or "package:com.ncsoft.lineage2m"
+                exact_match = False
+                for line in package_lines:
+                    # Match exactly "package:com.ncsoft.lineage2m" (not "package:com.ncsoft.lineage2mnu")
+                    if line.strip() == f"package:{package}":
+                        exact_match = True
+                        break
+                
+                if exact_match:
+                    installed_packages.append(package)
+                    logger.debug(f"Found exact match for known package: {package}")
+                else:
+                    logger.debug(f"No exact match for known package: {package} (might have variant like lineage2mnu)")
+            
+            # Also search for any package containing "lineage2m" to catch variants like "lineage2mnu"
+            # This finds packages that are NOT in the known list
+            try:
+                import re
+                # Look for any package containing lineage2m (case insensitive)
+                pattern = re.compile(r'package:([^\s]+lineage2m[^\s]*)', re.IGNORECASE)
+                matches = pattern.findall(all_packages_output)
+                for match in matches:
+                    if match not in installed_packages:
+                        installed_packages.append(match)
+                        logger.info(f"Found additional Lineage 2M package: {match}")
+            except Exception as e:
+                logger.debug(f"Error searching for lineage2m packages: {e}")
+            
+            # Sort: put exact matches from known list first, then variants
+            # This ensures we prefer known packages over variants
+            known_packages = [p for p in installed_packages if p in self.lineage2m_packages]
+            variant_packages = [p for p in installed_packages if p not in self.lineage2m_packages]
+            installed_packages = known_packages + variant_packages
+            
+            logger.info(f"Found {len(installed_packages)} installed Lineage 2M packages: {installed_packages}")
             return installed_packages
             
         except Exception as e:

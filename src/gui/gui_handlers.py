@@ -398,11 +398,396 @@ class GUIEventHandlers:
     
     # Per-device control methods
     def _start_device_bot(self, device_id):
-        """Start bot for a specific device"""
+        """Start bot for a specific device - automatically launches game if not running"""
         if device_id not in self.multi_device_manager.get_connected_devices():
             messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
             return
         
+        # Check game state and launch automatically if needed
+        def check_and_start():
+            try:
+                self._update_status(f"🔍 Checking game state for {device_id}...")
+                
+                # Get device session
+                with self.multi_device_manager.lock:
+                    if device_id not in self.multi_device_manager.connected_devices:
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"Device {device_id} session not found"))
+                        return
+                    
+                    session = self.multi_device_manager.connected_devices[device_id]
+                
+                # Check if game is running
+                game_detector = None
+                if hasattr(self, 'game_detector') and self.game_detector:
+                    # Use existing game detector if available
+                    game_detector = self.game_detector
+                else:
+                    # Create game detector for this device
+                    from ..modules.game_detector import GameDetector
+                    game_detector = GameDetector(session.adb, self.config.game)
+                
+                is_running, package = game_detector.is_lineage2m_running()
+                
+                # If game is not running, launch it automatically
+                if not is_running:
+                    self._update_status(f"🚀 Game not running, launching automatically for {device_id}...")
+                    logger.info(f"Game not running for {device_id}, launching automatically")
+                    
+                    # Get installed packages
+                    installed_packages = game_detector.get_installed_lineage2m_packages()
+                    if not installed_packages:
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"No Lineage 2M packages found on device {device_id}"))
+                        self.root.after(0, lambda: self._update_status(f"❌ No Lineage 2M packages found on {device_id}"))
+                        return
+                    
+                    # Use the first installed package (should be the variant like lineage2mnu)
+                    target_package = installed_packages[0]
+                    logger.info(f"Launching game package: {target_package} for {device_id}")
+                    
+                    # Launch the game
+                    launch_success = game_detector.launch_game(target_package)
+                    
+                    if not launch_success:
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to launch game on {device_id}. Check logs for details."))
+                        self.root.after(0, lambda: self._update_status(f"❌ Failed to launch game on {device_id}"))
+                        return
+                    
+                    # Wait a bit for game to start (optional, but helps ensure game is ready)
+                    self._update_status(f"⏳ Waiting for game to start on {device_id}...")
+                    time.sleep(3)  # Wait 3 seconds for game to start
+                    
+                    # Verify game started (optional check)
+                    is_running_new, package_new = game_detector.is_lineage2m_running()
+                    if is_running_new:
+                        logger.info(f"Game successfully launched and verified running: {package_new}")
+                        self._update_status(f"✅ Game launched successfully on {device_id}")
+                    else:
+                        logger.warning(f"Game launch command sent but game not detected yet on {device_id}")
+                        self._update_status(f"⚠️ Game launch command sent on {device_id}, proceeding anyway...")
+                
+                # Game is running (or was just launched), start the bot
+                self.root.after(0, lambda: self._actually_start_device_bot(device_id))
+                
+            except Exception as e:
+                logger.error(f"Error checking game state for {device_id}: {e}", exc_info=True)
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Error starting bot: {e}"))
+                self.root.after(0, lambda: self._update_status(f"❌ Error starting bot: {e}"))
+        
+        # Run check in background thread
+        threading.Thread(target=check_and_start, daemon=True).start()
+    
+    def _show_game_state_dialog_and_start(self, device_id, is_running, package, game_state, game_detector, screenshot=None, foreground_app=None, installed_packages=None):
+        """Show game state dialog where user can manually decide if game is running"""
+        try:
+            # Create custom dialog window
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title("Game State - Decide Before Starting Bot")
+            dialog.geometry("600x500")
+            dialog.transient(self.root)
+            dialog.grab_set()  # Make dialog modal
+            
+            # Store user's decision
+            user_decision = {'value': None}
+            
+            # Main frame
+            main_frame = ctk.CTkFrame(dialog)
+            main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+            
+            # Title
+            title_label = ctk.CTkLabel(
+                main_frame,
+                text="🎮 Game State Decision",
+                font=ctk.CTkFont(size=18, weight="bold")
+            )
+            title_label.pack(pady=(10, 5))
+            
+            device_label = ctk.CTkLabel(
+                main_frame,
+                text=f"Device: {device_id}",
+                font=ctk.CTkFont(size=12),
+                text_color="gray"
+            )
+            device_label.pack(pady=(0, 20))
+            
+            # Detected status frame
+            detected_frame = ctk.CTkFrame(main_frame)
+            detected_frame.pack(fill="x", padx=10, pady=5)
+            
+            detected_label = ctk.CTkLabel(
+                detected_frame,
+                text="🔍 System Detection:",
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            detected_label.pack(pady=5)
+            
+            if is_running:
+                detected_status = f"✅ Detected: Game Running\n📦 Package: {package}"
+                if game_state:
+                    detected_status += f"\n📊 Menu State: {game_state.get('menu_state', 'unknown')}\n"
+                    detected_status += f"   UI Elements: {game_state.get('ui_elements', 0)}"
+            else:
+                detected_status = f"❌ Detected: Game Not Running"
+                if foreground_app:
+                    detected_status += f"\n📱 Current App: {foreground_app}"
+            
+            detected_text = ctk.CTkLabel(
+                detected_frame,
+                text=detected_status,
+                font=ctk.CTkFont(size=12),
+                justify="left"
+            )
+            detected_text.pack(pady=5, padx=10)
+            
+            # User decision frame
+            decision_frame = ctk.CTkFrame(main_frame)
+            decision_frame.pack(fill="x", padx=10, pady=10)
+            
+            decision_label = ctk.CTkLabel(
+                decision_frame,
+                text="👤 Your Decision:",
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            decision_label.pack(pady=10)
+            
+            # Radio buttons for decision
+            decision_var = tk.StringVar(value="detected")  # Default to detected value
+            
+            radio_running = ctk.CTkRadioButton(
+                decision_frame,
+                text="✅ Game IS Running",
+                variable=decision_var,
+                value="running",
+                font=ctk.CTkFont(size=12)
+            )
+            radio_running.pack(pady=5, padx=20, anchor="w")
+            
+            radio_not_running = ctk.CTkRadioButton(
+                decision_frame,
+                text="❌ Game is NOT Running",
+                variable=decision_var,
+                value="not_running",
+                font=ctk.CTkFont(size=12)
+            )
+            radio_not_running.pack(pady=5, padx=20, anchor="w")
+            
+            # Set default based on detection
+            if is_running:
+                decision_var.set("running")
+            else:
+                decision_var.set("not_running")
+            
+            # Launch game button (only show if game is not running)
+            launch_button_frame = ctk.CTkFrame(main_frame)
+            launch_button_frame.pack(fill="x", padx=10, pady=5)
+            
+            launch_status_label = ctk.CTkLabel(
+                launch_button_frame,
+                text="",
+                font=ctk.CTkFont(size=11),
+                text_color="gray"
+            )
+            launch_status_label.pack(pady=5)
+            
+            def on_launch_game():
+                """Launch the game automatically"""
+                launch_status_label.configure(text="🚀 Launching game...", text_color="blue")
+                launch_btn.configure(state="disabled")
+                dialog.update()
+                
+                def launch_in_thread():
+                    try:
+                        logger.info(f"Launch button clicked for device: {device_id}")
+                        logger.info(f"Game detector available: {game_detector is not None}")
+                        logger.info(f"Package passed: {package}")
+                        logger.info(f"Installed packages: {installed_packages}")
+                        
+                        # Launch game using game detector
+                        if game_detector:
+                            # Check ADB connection status
+                            if hasattr(game_detector.adb, 'device_id'):
+                                logger.info(f"ADB device_id: {game_detector.adb.device_id}")
+                                logger.info(f"ADB connected: {game_detector.adb.connected}")
+                            
+                            # Use package if available, otherwise let game_detector find one
+                            target_package = package
+                            
+                            # If no package specified, prefer variant packages (like lineage2mnu) over base packages
+                            if not target_package and installed_packages:
+                                # Prefer packages that are NOT in the default list (variants like lineage2mnu)
+                                variant_packages = [p for p in installed_packages if 'lineage2mnu' in p or 'lineage2m.global' in p or 'lineage2m.sea' in p or 'lineage2m.kr' in p]
+                                if variant_packages:
+                                    target_package = variant_packages[0]
+                                    logger.info(f"Using variant package: {target_package}")
+                                else:
+                                    target_package = installed_packages[0]
+                            
+                            if not target_package:
+                                logger.error("No package specified and no installed packages found")
+                                dialog.after(0, lambda: launch_status_label.configure(
+                                    text="❌ No package found. Cannot launch game.", 
+                                    text_color="red"
+                                ))
+                                dialog.after(0, lambda: launch_btn.configure(state="normal"))
+                                return
+                            
+                            logger.info(f"Attempting to launch package: {target_package}")
+                            logger.info(f"ACTUAL ADB COMMAND will be: adb -s {game_detector.adb.device_id} shell monkey -p {target_package} 1")
+                            success = game_detector.launch_game(target_package)
+                            logger.info(f"Launch result: {success}")
+                            
+                            # Schedule UI update on main thread
+                            dialog.after(0, lambda s=success: on_launch_complete(s))
+                        else:
+                            logger.error("Game detector is None")
+                            dialog.after(0, lambda: launch_status_label.configure(text="❌ Game detector not available", text_color="red"))
+                            dialog.after(0, lambda: launch_btn.configure(state="normal"))
+                    except Exception as e:
+                        logger.error(f"Error launching game: {e}", exc_info=True)
+                        dialog.after(0, lambda: launch_status_label.configure(text=f"❌ Error: {e}", text_color="red"))
+                        dialog.after(0, lambda: launch_btn.configure(state="normal"))
+                
+                def on_launch_complete(success):
+                    if success:
+                        launch_status_label.configure(text="✅ Launch command executed! Checking if game started...", text_color="green")
+                        logger.info(f"Game launch command sent for {device_id}")
+                        
+                        # Wait a bit and check if game started
+                        dialog.after(3000, check_game_after_launch)
+                    else:
+                        launch_status_label.configure(
+                            text="❌ All launch methods failed. Check logs for details.\nTry manually launching the game.", 
+                            text_color="red"
+                        )
+                        launch_btn.configure(state="normal")
+                        logger.error(f"Game launch failed for {device_id}. Check logs above for command details.")
+                
+                # Run launch in background thread
+                threading.Thread(target=launch_in_thread, daemon=True).start()
+            
+            def check_game_after_launch():
+                """Check if game started after launch command"""
+                try:
+                    is_running_new, package_new = game_detector.is_lineage2m_running()
+                    if is_running_new:
+                        launch_status_label.configure(text="✅ Game is now running!", text_color="green")
+                        decision_var.set("running")
+                        detected_text.configure(
+                            text=f"✅ Detected: Game Running\n📦 Package: {package_new}\n\n✅ Game launched successfully!"
+                        )
+                        launch_btn.configure(state="normal")
+                        logger.info(f"Game successfully launched and verified running: {package_new}")
+                    else:
+                        # Check how many times we've tried (max 5 attempts = 15 seconds)
+                        if not hasattr(check_game_after_launch, 'attempts'):
+                            check_game_after_launch.attempts = 0
+                        check_game_after_launch.attempts += 1
+                        
+                        if check_game_after_launch.attempts < 5:
+                            launch_status_label.configure(
+                                text=f"⏳ Checking game status... ({check_game_after_launch.attempts}/5)", 
+                                text_color="orange"
+                            )
+                            # Try again after another delay
+                            dialog.after(3000, check_game_after_launch)
+                        else:
+                            launch_status_label.configure(
+                                text="⚠️ Game may not have started. Check device screen.\nYou can still start bot manually.", 
+                                text_color="orange"
+                            )
+                            launch_btn.configure(state="normal")
+                            logger.warning(f"Game launch command sent but game not detected after 15 seconds")
+                except Exception as e:
+                    logger.error(f"Error checking game after launch: {e}")
+                    launch_status_label.configure(text="⚠️ Could not verify game status", text_color="orange")
+                    launch_btn.configure(state="normal")
+            
+            if not is_running:
+                # Show available packages if multiple
+                if installed_packages and len(installed_packages) > 1:
+                    packages_text = f"Available packages: {', '.join(installed_packages)}"
+                    packages_label = ctk.CTkLabel(
+                        launch_button_frame,
+                        text=packages_text,
+                        font=ctk.CTkFont(size=10),
+                        text_color="gray"
+                    )
+                    packages_label.pack(pady=2)
+                elif installed_packages:
+                    packages_text = f"Package: {installed_packages[0]}"
+                    packages_label = ctk.CTkLabel(
+                        launch_button_frame,
+                        text=packages_text,
+                        font=ctk.CTkFont(size=10),
+                        text_color="gray"
+                    )
+                    packages_label.pack(pady=2)
+                
+                launch_btn = ctk.CTkButton(
+                    launch_button_frame,
+                    text="🚀 Launch Game Automatically",
+                    command=on_launch_game,
+                    width=200,
+                    fg_color="blue"
+                )
+                launch_btn.pack(pady=5)
+            
+            # Button frame
+            button_frame = ctk.CTkFrame(main_frame)
+            button_frame.pack(fill="x", padx=10, pady=20)
+            
+            def on_start():
+                user_decision['value'] = decision_var.get()
+                dialog.destroy()
+            
+            def on_cancel():
+                user_decision['value'] = None
+                dialog.destroy()
+            
+            start_btn = ctk.CTkButton(
+                button_frame,
+                text="▶️ Start Bot",
+                command=on_start,
+                width=150,
+                fg_color="green"
+            )
+            start_btn.pack(side="left", padx=10, pady=10)
+            
+            cancel_btn = ctk.CTkButton(
+                button_frame,
+                text="❌ Cancel",
+                command=on_cancel,
+                width=150
+            )
+            cancel_btn.pack(side="right", padx=10, pady=10)
+            
+            # Wait for dialog to close
+            dialog.wait_window()
+            
+            # Process user decision
+            decision = user_decision['value']
+            
+            if decision is None:
+                # User cancelled
+                self._update_status(f"❌ Bot start cancelled by user for {device_id}")
+                return
+            
+            # Log the decision
+            if decision == "running":
+                logger.info(f"User decided: Game IS running for {device_id}")
+                self._update_status(f"✅ Starting bot - User confirmed game is running ({device_id})")
+            else:
+                logger.info(f"User decided: Game is NOT running for {device_id}")
+                self._update_status(f"⚠️ Starting bot - User confirmed game is NOT running ({device_id})")
+            
+            # Start the bot with user's decision
+            self._actually_start_device_bot(device_id)
+                
+        except Exception as e:
+            logger.error(f"Error showing game state dialog: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Error showing game state: {e}")
+    
+    def _actually_start_device_bot(self, device_id):
+        """Actually start bot for a specific device (called after state confirmation)"""
         def device_bot_thread():
             try:
                 # Mark device bot as running
@@ -433,7 +818,8 @@ class GUIEventHandlers:
                             'take_screenshot'
                         )
                         
-                        if result:
+                        # Check if result is not None (result is a numpy array, so use 'is not None' instead of truthy check)
+                        if result is not None:
                             self.screenshot_queue.put(result)
                         
                         # Check game status on this device
@@ -443,8 +829,18 @@ class GUIEventHandlers:
                         logger.error(f"Error in device bot for {device_id}: {e}")
                         break
                     
-                    # Wait for configured interval
-                    time.sleep(self.interval_var.get())
+                    # Wait for configured interval, but check running flag periodically
+                    # This allows the bot to stop more responsively
+                    interval = self.interval_var.get()
+                    elapsed = 0
+                    check_interval = 0.5  # Check every 0.5 seconds
+                    while elapsed < interval:
+                        if (device_id not in self.device_control_widgets or 
+                            not self.device_control_widgets[device_id]['running']):
+                            break
+                        sleep_time = min(check_interval, interval - elapsed)
+                        time.sleep(sleep_time)
+                        elapsed += sleep_time
                 
             except Exception as e:
                 logger.error(f"Error in device bot thread for {device_id}: {e}")
@@ -462,9 +858,26 @@ class GUIEventHandlers:
     
     def _stop_device_bot(self, device_id):
         """Stop bot for a specific device"""
-        if device_id in self.device_control_widgets:
-            self.device_control_widgets[device_id]['running'] = False
-        self._update_status(f"⏹️ Stopping bot for {device_id}...")
+        try:
+            logger.info(f"Stopping bot for device: {device_id}")
+            self._update_status(f"⏹️ Stopping bot for {device_id}...")
+            
+            # Set running flag to False to stop the bot loop
+            if device_id in self.device_control_widgets:
+                self.device_control_widgets[device_id]['running'] = False
+                logger.info(f"Set running flag to False for device: {device_id}")
+            
+            # Send message to update button states immediately
+            self.message_queue.put({
+                'type': 'device_bot_stopped',
+                'device_id': device_id
+            })
+            
+            logger.info(f"Bot stop command sent for device: {device_id}")
+            
+        except Exception as e:
+            logger.error(f"Error stopping bot for {device_id}: {e}", exc_info=True)
+            self._update_status(f"❌ Error stopping bot for {device_id}: {e}")
     
     def _take_device_screenshot(self, device_id):
         """Take screenshot from a specific device"""
@@ -481,7 +894,8 @@ class GUIEventHandlers:
                     'take_screenshot'
                 )
                 
-                if result:
+                # Check if result is not None (result is a numpy array, so use 'is not None' instead of truthy check)
+                if result is not None:
                     self.screenshot_queue.put(result)
                     self.message_queue.put({
                         'type': 'screenshot_taken',
