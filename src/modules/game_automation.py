@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 
 # Constants
 DEFAULT_SCREEN_TRANSITION_TIME = 30.0  # Default time to wait for screen transitions (seconds)
+MAX_RETRY_COUNT = 10  # Maximum number of retries for each step before stopping bot
 
 
 class GameAutomation:
@@ -52,6 +53,13 @@ class GameAutomation:
         self.current_state = 'unknown'
         self.last_action_time = 0
         self.action_interval = 2.0  # Minimum time between actions (seconds)
+        
+        # Retry tracking for each step
+        self.step_retry_count = {}  # Dictionary to track retry count per step
+        self.max_retries = MAX_RETRY_COUNT
+        
+        # Flag to track if we've already tapped enter button (skip tap screen/enter checks after)
+        self.entered_after_tap = False
         
         # Screen dimensions (will be detected)
         self.screen_width = 0
@@ -114,6 +122,34 @@ class GameAutomation:
             self.screen_width = 1080
             self.screen_height = 1920
     
+    def _check_and_reset_retry(self, step_name: str) -> bool:
+        """
+        Check retry count for a step and increment it. Return True if should continue, False if should stop.
+        
+        Args:
+            step_name: Name of the step being retried
+            
+        Returns:
+            True if retries are within limit, False if max retries exceeded
+        """
+        if step_name not in self.step_retry_count:
+            self.step_retry_count[step_name] = 0
+        
+        self.step_retry_count[step_name] += 1
+        
+        if self.step_retry_count[step_name] > self.max_retries:
+            logger.error(f"Step '{step_name}' failed {self.max_retries} times. Stopping bot.")
+            self.stop()
+            return False
+        
+        logger.warning(f"Step '{step_name}' failed (attempt {self.step_retry_count[step_name]}/{self.max_retries})")
+        return True
+    
+    def _reset_retry(self, step_name: str):
+        """Reset retry count for a step after successful completion"""
+        if step_name in self.step_retry_count:
+            self.step_retry_count[step_name] = 0
+    
     def run_game_loop(self):
         """
         Main game automation loop
@@ -128,7 +164,9 @@ class GameAutomation:
             
             if not is_running:
                 # Game is not running, try to launch it
+                step_name = "game_launch"
                 logger.info("Game is not running, attempting to launch...")
+                
                 if self._launch_game_if_not_running():
                     # Wait for game to start
                     logger.info(f"Game launch attempted, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for game to start...")
@@ -136,31 +174,62 @@ class GameAutomation:
                     # Check again
                     is_running, package = self.game_detector.is_lineage2m_running()
                     if not is_running:
+                        if not self._check_and_reset_retry(step_name):
+                            return  # Bot stopped due to max retries
                         logger.warning(f"Game launch attempted but still not running, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
                         time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
                         return
+                    else:
+                        # Success - reset retry counter
+                        self._reset_retry(step_name)
                 else:
+                    if not self._check_and_reset_retry(step_name):
+                        return  # Bot stopped due to max retries
                     logger.warning(f"Failed to launch game, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
                     time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
                     return
             
-            # Check for "Tap screen" text/image and tap if found (non-blocking check)
-            if self._check_and_tap_tap_screen():
-                # After tapping "Tap screen", wait for screen transition
-                logger.info(f"Tapped 'Tap screen', waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for screen transition...")
-                time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                
-                # Wait for enter button to appear and tap it (blocking wait)
-                logger.info("Waiting for enter_button.png to appear...")
-                if self._wait_and_tap_enter_button(max_wait_time=15.0, check_interval=0.5):
-                    # After tapping enter button, wait for screen transition
-                    logger.info(f"Enter button tapped, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for screen transition...")
+            # Skip tap screen and enter button checks if we've already entered after tapping
+            if not self.entered_after_tap:
+                # Check for "Tap screen" text/image and tap if found (non-blocking check)
+                step_name = "tap_screen"
+                if self._check_and_tap_tap_screen():
+                    # Success - reset retry counter
+                    self._reset_retry(step_name)
+                    
+                    # After tapping "Tap screen", wait for screen transition
+                    logger.info(f"Tapped 'Tap screen', waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for screen transition...")
                     time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+                    
+                    # Wait for enter button to appear and tap it (blocking wait)
+                    step_name = "enter_button"
+                    logger.info("Waiting for enter_button.png to appear...")
+                    if self._wait_and_tap_enter_button(max_wait_time=15.0, check_interval=0.5):
+                        # Success - reset retry counter
+                        self._reset_retry(step_name)
+                        
+                        # After tapping enter button, wait 30 seconds without checking for anything
+                        logger.info(f"Enter button tapped, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s before detecting game state...")
+                        time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+                        
+                        # Mark that we've entered after tapping - skip tap screen/enter checks from now on
+                        self.entered_after_tap = True
+                        
+                        # Now try to detect current game state (skip tap screen and enter button checks)
+                        logger.info("Detecting current game state after enter button tap...")
+                        # Continue to game state detection below (don't return here)
+                    else:
+                        if not self._check_and_reset_retry(step_name):
+                            return  # Bot stopped due to max retries
+                        logger.warning("Enter button not found within timeout, continuing...")
+                        return
                 else:
-                    logger.warning("Enter button not found within timeout, continuing...")
-                
-                # Continue with normal game loop
-                return
+                    # Tap screen not detected - check retry count
+                    if not self._check_and_reset_retry(step_name):
+                        return  # Bot stopped due to max retries
+            else:
+                # Already entered after tapping, skip tap screen and enter button checks
+                logger.debug("Already tapped enter button, skipping tap screen/enter button checks, proceeding to game state detection...")
             
             # Detect current game state
             game_state = self.game_detector.detect_game_state()
@@ -168,6 +237,11 @@ class GameAutomation:
             
             # Execute appropriate actions based on game state
             if self.current_state == 'in_game':
+                # Success - reset any retry counters and reset entered flag
+                self._reset_retry("game_launch")
+                self._reset_retry("tap_screen")
+                self._reset_retry("enter_button")
+                self.entered_after_tap = False  # Reset flag for next session
                 self._execute_in_game_actions()
             elif self.current_state == 'main_menu':
                 self._handle_main_menu()
@@ -179,13 +253,21 @@ class GameAutomation:
                 logger.debug(f"Waiting for server selection... ({DEFAULT_SCREEN_TRANSITION_TIME}s)")
                 time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
             elif self.current_state == 'in_game_with_UI':
+                # Success - reset any retry counters and reset entered flag
+                self._reset_retry("game_launch")
+                self._reset_retry("tap_screen")
+                self._reset_retry("enter_button")
+                self.entered_after_tap = False  # Reset flag for next session
                 self._execute_in_game_actions()
             else:
                 logger.debug(f"Unknown game state: {self.current_state}, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
                 time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
                 
         except Exception as e:
+            step_name = "game_loop_error"
             logger.error(f"Error in game loop: {e}", exc_info=True)
+            if not self._check_and_reset_retry(step_name):
+                return  # Bot stopped due to max retries
             time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
     
     def _execute_in_game_actions(self):
