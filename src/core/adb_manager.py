@@ -267,8 +267,33 @@ class ADBManager:
     
     def is_app_running(self, package_name: str) -> bool:
         """Check if a specific app is currently running"""
-        success, output = self.execute_adb_command(['shell', 'pidof', package_name])
-        return success and output.strip() != ""
+        try:
+            # Method 1: Use pidof (works if process name matches package)
+            success, output = self.execute_adb_command(['shell', 'pidof', package_name])
+            if success and output.strip():
+                logger.debug(f"App {package_name} found running via pidof: {output.strip()}")
+                return True
+            
+            # Method 2: Use ps to find running processes
+            success, output = self.execute_adb_command(['shell', 'ps', '-A'])
+            if success and output:
+                # Check if package name appears in process list
+                if package_name in output:
+                    logger.debug(f"App {package_name} found running via ps")
+                    return True
+            
+            # Method 3: Use dumpsys meminfo to check if app is in memory
+            success, output = self.execute_adb_command(['shell', 'dumpsys', 'meminfo', package_name])
+            if success and output and 'No process found' not in output:
+                logger.debug(f"App {package_name} found running via dumpsys meminfo")
+                return True
+            
+            logger.debug(f"App {package_name} not found running")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error checking if app is running {package_name}: {e}")
+            return False
     
     def get_foreground_app(self) -> Optional[str]:
         """Get the package name of the currently foreground app"""
@@ -418,6 +443,72 @@ class ADBManager:
             logger.error(f"Error getting installed packages: {e}")
         
         return installed_packages
+    
+    def tap(self, x: int, y: int) -> bool:
+        """
+        Tap at specific coordinates on the device screen
+        
+        Args:
+            x: X coordinate
+            y: Y coordinate
+            
+        Returns:
+            True if tap command succeeded, False otherwise
+        """
+        try:
+            cmd = ['shell', 'input', 'tap', str(x), str(y)]
+            success, output = self.execute_adb_command(cmd)
+            
+            if success:
+                logger.debug(f"Tapped at ({x}, {y})")
+            else:
+                logger.warning(f"Failed to tap at ({x}, {y}): {output}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error tapping at ({x}, {y}): {e}")
+            return False
+    
+    def launch_app(self, package_name: str) -> bool:
+        """
+        Launch an Android app by package name
+        
+        Args:
+            package_name: Package name of the app to launch (e.g., 'com.ncsoft.lineage2m')
+            
+        Returns:
+            True if launch command succeeded, False otherwise
+        """
+        try:
+            # Use 'monkey' command to launch app (works when main activity is unknown)
+            # Alternative: Use 'am start' with package name
+            cmd = ['shell', 'monkey', '-p', package_name, '-c', 'android.intent.category.LAUNCHER', '1']
+            success, output = self.execute_adb_command(cmd)
+            
+            if success:
+                logger.info(f"Launch command sent for {package_name}")
+                # Give app time to start
+                time.sleep(2)
+                return True
+            else:
+                logger.warning(f"Failed to launch {package_name}: {output}")
+                # Try alternative method using 'am start'
+                try:
+                    cmd = ['shell', 'am', 'start', '-n', f'{package_name}/.MainActivity']
+                    success, output = self.execute_adb_command(cmd)
+                    if success:
+                        logger.info(f"Launched {package_name} using am start")
+                        time.sleep(2)
+                        return True
+                except Exception as e:
+                    logger.debug(f"Alternative launch method failed: {e}")
+                
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error launching app {package_name}: {e}")
+            return False
     
     def check_game_status(self, device_id: str = None, game_packages: list = None) -> dict:
         """Check game installation and running status on a device"""

@@ -47,23 +47,61 @@ class GameDetector:
             Tuple of (is_running, package_name)
         """
         try:
+            # First, check foreground app
             foreground_app = self.adb.get_foreground_app()
+            logger.debug(f"Foreground app: {foreground_app}")
             
-            # Check if foreground app is Lineage 2M
+            # Check if foreground app is Lineage 2M (exact or partial match)
             if foreground_app:
                 for package in self.lineage2m_packages:
-                    if package in foreground_app:
+                    # Check for exact match or if package is contained in foreground app
+                    if package == foreground_app or package in foreground_app:
+                        logger.info(f"Lineage 2M detected as foreground app: {package} (foreground: {foreground_app})")
                         return True, package
+                    
+                # Also check reverse - if foreground app contains any lineage2m package
+                if 'lineage2m' in foreground_app.lower():
+                    # Find the matching package
+                    for package in self.lineage2m_packages:
+                        if package in foreground_app:
+                            logger.info(f"Lineage 2M detected in foreground app: {package} (foreground: {foreground_app})")
+                            return True, package
+                    # If no exact match but contains lineage2m, return the foreground app itself
+                    logger.info(f"Lineage 2M detected (variant): {foreground_app}")
+                    return True, foreground_app
             
             # Check if any Lineage 2M package is running (even if not foreground)
+            logger.debug(f"Checking running packages: {self.lineage2m_packages}")
             for package in self.lineage2m_packages:
-                if self.adb.is_app_running(package):
+                is_running = self.adb.is_app_running(package)
+                logger.debug(f"Package {package} running check: {is_running}")
+                if is_running:
+                    logger.info(f"Lineage 2M detected as running (background): {package}")
                     return True, package
             
+            # Additional check: List all running processes and search for lineage2m
+            try:
+                success, output = self.adb.execute_adb_command(['shell', 'ps', '-A'])
+                if success and output:
+                    # Search for lineage2m in process list
+                    for line in output.split('\n'):
+                        if 'lineage2m' in line.lower():
+                            # Try to extract package name from process line
+                            import re
+                            # Look for package pattern in the line
+                            match = re.search(r'([a-zA-Z0-9._]*lineage2m[a-zA-Z0-9._]*)', line, re.IGNORECASE)
+                            if match:
+                                found_package = match.group(1)
+                                logger.info(f"Lineage 2M detected in process list: {found_package}")
+                                return True, found_package
+            except Exception as e:
+                logger.debug(f"Error checking process list: {e}")
+            
+            logger.debug("Lineage 2M not detected as running")
             return False, None
             
         except Exception as e:
-            logger.error(f"Error checking if Lineage 2M is running: {e}")
+            logger.error(f"Error checking if Lineage 2M is running: {e}", exc_info=True)
             return False, None
     
     def detect_game_state(self) -> Dict:
@@ -82,14 +120,23 @@ class GameDetector:
                     'screenshot_taken': False
                 }
             
+            # Check for "Tap screen" text first (common game startup state)
+            tap_screen_detected = self._detect_tap_screen_text(screenshot)
+            
             # Basic game state detection
             state = {
-                'status': 'unknown',
+                'status': 'select_server' if tap_screen_detected else 'unknown',
                 'screenshot_taken': True,
                 'screen_size': screenshot.shape[:2],
                 'timestamp': self._get_current_timestamp(),
-                'message': 'Screenshot captured successfully'
+                'message': 'Screenshot captured successfully',
+                'tap_screen_detected': tap_screen_detected
             }
+            
+            # If "Tap screen" is detected, we're in server selection state
+            if tap_screen_detected:
+                logger.info("'Tap screen' text detected - game is in server selection state")
+                return state
             
             # Analyze screenshot for game elements
             game_elements = self._analyze_screenshot(screenshot)
@@ -104,6 +151,67 @@ class GameDetector:
                 'message': f'Error detecting game state: {e}',
                 'screenshot_taken': False
             }
+    
+    def _detect_tap_screen_text(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect "Tap screen" text on screenshot using OCR
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if "Tap screen" text is detected, False otherwise
+        """
+        try:
+            # Try to import EasyOCR
+            try:
+                import easyocr
+            except ImportError:
+                logger.debug("EasyOCR not available for 'Tap screen' detection")
+                return False
+            
+            # Initialize OCR reader if not already done
+            if not hasattr(self, '_ocr_reader') or self._ocr_reader is None:
+                try:
+                    logger.debug("Initializing EasyOCR reader for 'Tap screen' detection...")
+                    self._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                    logger.debug("EasyOCR reader initialized")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize EasyOCR: {e}")
+                    return False
+            
+            # Convert BGR to RGB for EasyOCR
+            rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
+            
+            # Perform OCR on the entire screenshot
+            # Use paragraph=False to get individual text detections
+            results = self._ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
+            
+            # Search for "Tap screen" or variations
+            tap_screen_variations = [
+                'tap screen',
+                'tap to screen',
+                'tap the screen',
+                'tap screen to',
+                'tap',
+                'tap to start',
+                'tap to begin'
+            ]
+            
+            for (bbox, text, confidence) in results:
+                text_lower = text.lower().strip()
+                # Check if any variation matches
+                for variation in tap_screen_variations:
+                    if variation in text_lower:
+                        logger.info(f"Detected 'Tap screen' text: '{text}' (confidence: {confidence:.3f})")
+                        return True
+            
+            logger.debug("'Tap screen' text not detected in screenshot")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error detecting 'Tap screen' text: {e}")
+            return False
     
     def _analyze_screenshot(self, screenshot: np.ndarray) -> Dict:
         """

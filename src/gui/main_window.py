@@ -20,6 +20,7 @@ from ..modules.game_detector import GameDetector
 from ..utils.config import config_manager
 from ..utils.logger import get_logger
 from ..utils.exceptions import BotError
+from ..utils.device_state_monitor import device_state_monitor
 
 logger = get_logger(__name__)
 
@@ -67,6 +68,10 @@ class MainWindow(GUIEventHandlers):
         
         # Restore saved devices on startup
         self._restore_saved_devices()
+        
+        # Start device state monitoring
+        device_state_monitor.set_update_callback(self._update_device_states)
+        device_state_monitor.start_monitoring(interval=2.0)
         
         logger.info("GUI initialized successfully")
     
@@ -412,14 +417,49 @@ class MainWindow(GUIEventHandlers):
         )
         test_btn.pack(side="left", padx=5, pady=5)
         
+        # Check game status button
+        check_game_btn = ctk.CTkButton(
+            control_frame,
+            text="🔍 Check Game",
+            command=lambda dev_id=device_id: self._check_game_status(dev_id),
+            width=100,
+            state="normal" if is_connected else "disabled"
+        )
+        check_game_btn.pack(side="left", padx=5, pady=5)
+        
+        # State monitoring labels
+        state_frame = ctk.CTkFrame(device_frame)
+        state_frame.pack(fill="x", padx=10, pady=(5, 10))
+        
+        # Bot state label
+        bot_state_label = ctk.CTkLabel(
+            state_frame,
+            text="🤖 Bot: Stopped",
+            font=ctk.CTkFont(size=11),
+            anchor="w"
+        )
+        bot_state_label.pack(fill="x", padx=5, pady=2)
+        
+        # Game state label
+        game_state_label = ctk.CTkLabel(
+            state_frame,
+            text="🎮 Game: Not Running",
+            font=ctk.CTkFont(size=11),
+            anchor="w"
+        )
+        game_state_label.pack(fill="x", padx=5, pady=2)
+        
         # Store widget references for later updates
         self.device_control_widgets[device_id] = {
             'frame': device_frame,
             'status_label': status_label,
+            'bot_state_label': bot_state_label,
+            'game_state_label': game_state_label,
             'start_btn': start_btn,
             'stop_btn': stop_btn,
             'screenshot_btn': screenshot_btn,
             'test_btn': test_btn,
+            'check_game_btn': check_game_btn,
             'running': False
         }
     
@@ -676,13 +716,55 @@ class MainWindow(GUIEventHandlers):
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self.root.mainloop()
     
+    def _update_device_states(self):
+        """Update device state displays (called by state monitor)"""
+        try:
+            # Schedule GUI update on main thread
+            self.root.after(0, self._do_update_device_states)
+        except Exception as e:
+            logger.error(f"Error scheduling device state update: {e}")
+    
+    def _do_update_device_states(self):
+        """Actually update device state displays (runs on main thread)"""
+        try:
+            # Get all device states
+            all_states = device_state_monitor.get_all_states()
+            
+            # Update each device widget
+            for device_id in all_states.keys():
+                if device_id in self.device_control_widgets:
+                    widgets = self.device_control_widgets[device_id]
+                    
+                    # Get state summary
+                    summary = device_state_monitor.get_state_summary(device_id)
+                    
+                    # Update bot state label (summary already includes emoji)
+                    if 'bot_state_label' in widgets and widgets['bot_state_label'].winfo_exists():
+                        widgets['bot_state_label'].configure(text=f"🤖 Bot: {summary['bot_status']}")
+                    
+                    # Update game state label (summary already includes emoji)
+                    if 'game_state_label' in widgets and widgets['game_state_label'].winfo_exists():
+                        # Format game status more clearly
+                        game_status_text = summary['game_status']
+                        # Remove duplicate emoji if present
+                        if game_status_text.startswith('🎮'):
+                            game_status_text = game_status_text[1:].strip()
+                        elif game_status_text.startswith('⏸️'):
+                            game_status_text = game_status_text[1:].strip()
+                        
+                        widgets['game_state_label'].configure(text=f"🎮 Game: {game_status_text}")
+        except Exception as e:
+            logger.error(f"Error updating device states: {e}", exc_info=True)
+    
     def _on_closing(self):
         """Handle window closing"""
         if self.bot_running:
             if messagebox.askokcancel("Quit", "Bot is running. Do you want to stop it and quit?"):
                 self._stop_bot()
-                self.root.destroy()
-        else:
-            self.root.destroy()
+        
+        # Stop device state monitoring
+        device_state_monitor.stop_monitoring()
+        
+        self.root.destroy()
 
 # Additional GUI methods will be added in the next file...

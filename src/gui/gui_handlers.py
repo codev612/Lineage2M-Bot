@@ -21,10 +21,12 @@ import numpy as np
 from ..core.device_manager import DeviceManager
 from ..core.multi_device_manager import MultiDeviceManager
 from ..modules.game_detector import GameDetector
+from ..modules.game_automation import GameAutomation
 from ..utils.config import config_manager
 from ..utils.logger import get_logger
 from ..utils.exceptions import BotError
 from ..utils.device_persistence import device_persistence
+from ..utils.device_state_monitor import device_state_monitor
 
 logger = get_logger(__name__)
 
@@ -191,6 +193,25 @@ class GUIEventHandlers:
                             restored_count += 1
                             logger.info(f"Restored device: {device_id}")
                             
+                            # Register device with state monitor
+                            device_state_monitor.register_device(device_id)
+                            device_state_monitor.update_connection_state(device_id, True)
+                            
+                            # Update game state in monitor if game is running
+                            if device_info.get('game_status', {}).get('running'):
+                                running_package = device_info['game_status'].get('foreground_package') or \
+                                                 device_info['game_status'].get('running_packages', [None])[0]
+                                device_state_monitor.update_game_state(
+                                    device_id,
+                                    is_running=True,
+                                    package_name=running_package,
+                                    game_state='detected'
+                                )
+                                logger.info(f"Updated game state for restored {device_id}: running={True}, package={running_package}")
+                            else:
+                                device_state_monitor.update_game_state(device_id, is_running=False)
+                                logger.info(f"Updated game state for restored {device_id}: running=False")
+                            
                             # Add device to list
                             if not hasattr(self, 'devices_list') or self.devices_list is None:
                                 self.devices_list = []
@@ -200,6 +221,7 @@ class GUIEventHandlers:
                                 self.devices_list.append(device_info)
                         else:
                             logger.warning(f"Failed to connect to saved device: {device_id}")
+                            device_state_monitor.update_connection_state(device_id, False)
                             
                     except Exception as e:
                         logger.error(f"Error restoring device {device_id}: {e}", exc_info=True)
@@ -325,6 +347,25 @@ class GUIEventHandlers:
                 if self.multi_device_manager.connect_device(device_id, device_info):
                     logger.info(f"Successfully connected to manually added device: {device_id}")
                     
+                    # Register device with state monitor
+                    device_state_monitor.register_device(device_id)
+                    device_state_monitor.update_connection_state(device_id, True)
+                    
+                    # Update game state in monitor if game is running
+                    if device_info.get('game_status', {}).get('running'):
+                        running_package = device_info['game_status'].get('foreground_package') or \
+                                         device_info['game_status'].get('running_packages', [None])[0]
+                        device_state_monitor.update_game_state(
+                            device_id,
+                            is_running=True,
+                            package_name=running_package,
+                            game_state='detected'
+                        )
+                        logger.info(f"Updated game state for {device_id}: running={True}, package={running_package}")
+                    else:
+                        device_state_monitor.update_game_state(device_id, is_running=False)
+                        logger.info(f"Updated game state for {device_id}: running=False")
+                    
                     # Save device to persistent storage
                     device_persistence.save_device(device_id)
                     
@@ -429,7 +470,15 @@ class GUIEventHandlers:
                 self._update_status("🚫 Disconnecting from all devices...")
                 self._show_progress()
                 
+                # Get all connected devices before disconnecting
+                connected_devices = list(self.multi_device_manager.get_connected_devices().keys())
+                
                 self.multi_device_manager.disconnect_all()
+                
+                # Update state monitor for all disconnected devices
+                for device_id in connected_devices:
+                    device_state_monitor.update_connection_state(device_id, False)
+                    device_state_monitor.update_bot_state(device_id, False, "Disconnected")
                 
                 self.message_queue.put({
                     'type': 'all_devices_disconnected'
@@ -1057,45 +1106,160 @@ class GUIEventHandlers:
                     'device_id': device_id
                 })
                 
+                # Register device with state monitor
+                device_state_monitor.register_device(device_id)
+                device_state_monitor.update_bot_state(device_id, True, "Starting")
+                
+                # Initialize game automation for this device
+                try:
+                    # Get device session
+                    connected_devices = self.multi_device_manager.get_connected_devices()
+                    if device_id not in connected_devices:
+                        logger.error(f"Device {device_id} not in connected devices")
+                        device_state_monitor.update_bot_state(device_id, False, error="Device not connected")
+                        return
+                    
+                    device_session = self.multi_device_manager.connected_devices[device_id]
+                    adb_manager = device_session.adb
+                    
+                    # Create game detector for this device
+                    game_detector = GameDetector(adb_manager, self.config.game)
+                    
+                    # Create game automation with device ID for state monitoring
+                    game_automation = GameAutomation(adb_manager, game_detector, device_id=device_id)
+                    game_automation.start()
+                    
+                    logger.info(f"Game automation initialized for device {device_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error initializing game automation for {device_id}: {e}", exc_info=True)
+                    device_state_monitor.update_bot_state(device_id, False, error=str(e))
+                    return
+                
                 # Device-specific bot loop
-                while (device_id in self.device_control_widgets and 
-                       self.device_control_widgets[device_id]['running']):
-                    
-                    # Execute bot commands on specific device
+                try:
+                    while (device_id in self.device_control_widgets and 
+                           self.device_control_widgets[device_id]['running']):
+                        
+                        # Execute bot commands on specific device
+                        try:
+                            # Check if device is still connected
+                            if device_id not in self.multi_device_manager.get_connected_devices():
+                                logger.warning(f"Device {device_id} disconnected, stopping bot")
+                                device_state_monitor.update_bot_state(device_id, False, error="Device disconnected")
+                                break
+                            
+                            # Check game state
+                            is_running, package = game_detector.is_lineage2m_running()
+                            logger.debug(f"Device {device_id} - Game running check: {is_running}, package: {package}")
+                            
+                            if is_running:
+                                game_state = game_detector.detect_game_state()
+                                game_state_str = game_state.get('status', 'unknown')
+                                tap_screen_detected = game_state.get('tap_screen_detected', False)
+                                
+                                logger.debug(f"Device {device_id} - Game state detected: {game_state_str}, tap_screen: {tap_screen_detected}")
+                                
+                                # If "Tap screen" is detected, set state to "select_server" and ensure bot is running
+                                if tap_screen_detected:
+                                    game_state_str = 'select_server'
+                                    # Update bot state to running if it's not already
+                                    current_bot_state = device_state_monitor.get_device_state(device_id)
+                                    if current_bot_state and not current_bot_state.bot_state.is_running:
+                                        device_state_monitor.update_bot_state(device_id, True, "Waiting for server selection")
+                                
+                                device_state_monitor.update_game_state(
+                                    device_id,
+                                    is_running=True,
+                                    package_name=package,
+                                    game_state=game_state_str
+                                )
+                            else:
+                                logger.debug(f"Device {device_id} - Game not detected as running")
+                                device_state_monitor.update_game_state(device_id, is_running=False)
+                                
+                                # Also check using check_game_status for more reliable detection
+                                try:
+                                    game_packages = self.config.game.packages
+                                    game_status = adb_manager.check_game_status(device_id, game_packages)
+                                    if game_status.get('game_running'):
+                                        running_packages = game_status.get('running_packages', [])
+                                        if running_packages:
+                                            logger.info(f"Device {device_id} - Game detected via check_game_status: {running_packages[0]}")
+                                            
+                                            # Check for "Tap screen" even if package check didn't detect it
+                                            try:
+                                                screenshot = adb_manager.take_screenshot()
+                                                if screenshot is not None:
+                                                    tap_screen_detected = game_detector._detect_tap_screen_text(screenshot)
+                                                    game_state_str = 'select_server' if tap_screen_detected else 'detected'
+                                                    
+                                                    if tap_screen_detected:
+                                                        # Update bot state to running
+                                                        device_state_monitor.update_bot_state(device_id, True, "Waiting for server selection")
+                                                else:
+                                                    game_state_str = 'detected'
+                                            except Exception as e:
+                                                logger.debug(f"Error checking tap screen text: {e}")
+                                                game_state_str = 'detected'
+                                            
+                                            device_state_monitor.update_game_state(
+                                                device_id,
+                                                is_running=True,
+                                                package_name=running_packages[0],
+                                                game_state=game_state_str
+                                            )
+                                except Exception as e:
+                                    logger.debug(f"Error checking game status via check_game_status: {e}")
+                            
+                            # Run game automation loop
+                            game_automation.run_game_loop()
+                            
+                            # Update bot state with last action
+                            current_game_state = game_automation.current_state
+                            if current_game_state == 'in_game':
+                                device_state_monitor.update_bot_state(device_id, True, "Playing")
+                            elif current_game_state == 'main_menu':
+                                device_state_monitor.update_bot_state(device_id, True, "In Menu")
+                            else:
+                                device_state_monitor.update_bot_state(device_id, True, "Monitoring")
+                            
+                            # Take screenshot from this device
+                            result = self.multi_device_manager.execute_on_device(
+                                device_id, 
+                                'take_screenshot'
+                            )
+                            
+                            # Check if result is not None (result is a numpy array, so use 'is not None' instead of truthy check)
+                            if result is not None:
+                                self.screenshot_queue.put(result)
+                            
+                        except Exception as e:
+                            logger.error(f"Error in device bot for {device_id}: {e}", exc_info=True)
+                            device_state_monitor.update_bot_state(device_id, True, error=str(e))
+                            time.sleep(1)  # Wait a bit before retrying
+                            continue
+                        
+                        # Wait for configured interval, but check running flag periodically
+                        # This allows the bot to stop more responsively
+                        interval = self.interval_var.get()
+                        elapsed = 0
+                        check_interval = 0.5  # Check every 0.5 seconds
+                        while elapsed < interval:
+                            if (device_id not in self.device_control_widgets or 
+                                not self.device_control_widgets[device_id]['running']):
+                                break
+                            sleep_time = min(check_interval, interval - elapsed)
+                            time.sleep(sleep_time)
+                            elapsed += sleep_time
+                
+                finally:
+                    # Stop game automation when bot stops
                     try:
-                        # Check if device is still connected
-                        if device_id not in self.multi_device_manager.get_connected_devices():
-                            break
-                        
-                        # Take screenshot from this device
-                        result = self.multi_device_manager.execute_on_device(
-                            device_id, 
-                            'take_screenshot'
-                        )
-                        
-                        # Check if result is not None (result is a numpy array, so use 'is not None' instead of truthy check)
-                        if result is not None:
-                            self.screenshot_queue.put(result)
-                        
-                        # Check game status on this device
-                        # Add more device-specific bot logic here
-                        
+                        game_automation.stop()
+                        logger.info(f"Game automation stopped for device {device_id}")
                     except Exception as e:
-                        logger.error(f"Error in device bot for {device_id}: {e}")
-                        break
-                    
-                    # Wait for configured interval, but check running flag periodically
-                    # This allows the bot to stop more responsively
-                    interval = self.interval_var.get()
-                    elapsed = 0
-                    check_interval = 0.5  # Check every 0.5 seconds
-                    while elapsed < interval:
-                        if (device_id not in self.device_control_widgets or 
-                            not self.device_control_widgets[device_id]['running']):
-                            break
-                        sleep_time = min(check_interval, interval - elapsed)
-                        time.sleep(sleep_time)
-                        elapsed += sleep_time
+                        logger.error(f"Error stopping game automation: {e}")
                 
             except Exception as e:
                 logger.error(f"Error in device bot thread for {device_id}: {e}")
@@ -1103,6 +1267,9 @@ class GUIEventHandlers:
                 # Mark device bot as stopped
                 if device_id in self.device_control_widgets:
                     self.device_control_widgets[device_id]['running'] = False
+                
+                # Update state monitor
+                device_state_monitor.update_bot_state(device_id, False, "Stopped")
                 
                 self.message_queue.put({
                     'type': 'device_bot_stopped',
@@ -1133,6 +1300,93 @@ class GUIEventHandlers:
         except Exception as e:
             logger.error(f"Error stopping bot for {device_id}: {e}", exc_info=True)
             self._update_status(f"❌ Error stopping bot for {device_id}: {e}")
+    
+    def _check_game_status(self, device_id):
+        """Check and display game status for a specific device"""
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
+            return
+        
+        def check_thread():
+            try:
+                self._update_status(f"🔍 Checking game status for {device_id}...")
+                
+                # Get device session
+                device_session = self.multi_device_manager.connected_devices[device_id]
+                adb_manager = device_session.adb
+                
+                # Create game detector
+                game_detector = GameDetector(adb_manager, self.config.game)
+                
+                # Check using is_lineage2m_running
+                is_running, package = game_detector.is_lineage2m_running()
+                
+                # Also check using check_game_status
+                game_packages = self.config.game.packages
+                game_status = adb_manager.check_game_status(device_id, game_packages)
+                
+                # Get foreground app
+                foreground_app = adb_manager.get_foreground_app()
+                
+                # Check for "Tap screen" text
+                tap_screen_detected = False
+                try:
+                    screenshot = adb_manager.take_screenshot()
+                    if screenshot is not None:
+                        tap_screen_detected = game_detector._detect_tap_screen_text(screenshot)
+                except Exception as e:
+                    logger.debug(f"Error checking tap screen text: {e}")
+                
+                # Build status message
+                status_lines = [
+                    f"Game Status Check for {device_id}",
+                    "=" * 50,
+                    f"Foreground App: {foreground_app or 'Unknown'}",
+                    "",
+                    f"is_lineage2m_running(): {is_running}",
+                    f"Package: {package or 'None'}",
+                    "",
+                    f"check_game_status():",
+                    f"  Game Running: {game_status.get('game_running', False)}",
+                    f"  Game Installed: {game_status.get('game_installed', False)}",
+                    f"  Installed Packages: {game_status.get('installed_packages', [])}",
+                    f"  Running Packages: {game_status.get('running_packages', [])}",
+                    f"  Foreground Package: {game_status.get('foreground_package', 'None')}",
+                    "",
+                    f"'Tap screen' detected: {tap_screen_detected}",
+                    "",
+                    "=" * 50
+                ]
+                
+                status_text = "\n".join(status_lines)
+                
+                # Update state monitor
+                if is_running or game_status.get('game_running'):
+                    game_state_str = 'select_server' if tap_screen_detected else 'detected'
+                    
+                    # If "Tap screen" is detected, set bot state to running
+                    if tap_screen_detected:
+                        device_state_monitor.update_bot_state(device_id, True, "Waiting for server selection")
+                    
+                    device_state_monitor.update_game_state(
+                        device_id,
+                        is_running=True,
+                        package_name=package or game_status.get('running_packages', [None])[0],
+                        game_state=game_state_str
+                    )
+                else:
+                    device_state_monitor.update_game_state(device_id, is_running=False)
+                
+                # Show result
+                self.root.after(0, lambda: messagebox.showinfo("Game Status Check", status_text))
+                self._update_status(f"✅ Game status checked for {device_id}")
+                
+            except Exception as e:
+                error_msg = f"Error checking game status: {e}"
+                logger.error(error_msg, exc_info=True)
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        threading.Thread(target=check_thread, daemon=True).start()
     
     def _take_device_screenshot(self, device_id):
         """Take screenshot from a specific device"""
