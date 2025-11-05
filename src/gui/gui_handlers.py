@@ -2413,51 +2413,10 @@ For support and documentation, visit the project repository."""
         self._add_log(status_text.strip())
     
     def _update_screenshot_display(self, screenshot):
-        """Update the screenshot display"""
-        try:
-            # Resize screenshot to fit canvas
-            canvas_width = self.screenshot_canvas.winfo_width()
-            canvas_height = self.screenshot_canvas.winfo_height()
-            
-            if canvas_width > 1 and canvas_height > 1:
-                # Convert OpenCV to PIL
-                screenshot_rgb = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(screenshot_rgb)
-                
-                # Calculate aspect ratio
-                img_width, img_height = pil_image.size
-                canvas_ratio = canvas_width / canvas_height
-                img_ratio = img_width / img_height
-                
-                if img_ratio > canvas_ratio:
-                    # Image is wider
-                    new_width = canvas_width - 20
-                    new_height = int(new_width / img_ratio)
-                else:
-                    # Image is taller
-                    new_height = canvas_height - 20
-                    new_width = int(new_height * img_ratio)
-                
-                # Resize image
-                resized_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                
-                # Convert to PhotoImage
-                photo = ImageTk.PhotoImage(resized_image)
-                
-                # Update canvas
-                self.screenshot_canvas.delete("all")
-                self.screenshot_canvas.create_image(
-                    canvas_width // 2,
-                    canvas_height // 2,
-                    image=photo,
-                    anchor="center"
-                )
-                
-                # Keep a reference to prevent garbage collection
-                self.screenshot_canvas.image = photo
-                
-        except Exception as e:
-            logger.error(f"Error updating screenshot display: {e}")
+        """Update the screenshot display (removed - no longer used)"""
+        # This function is kept for compatibility but does nothing
+        # The live screenshot feature has been removed from the monitor tab
+        pass
     
     def _show_test_results(self, results):
         """Show connection test results"""

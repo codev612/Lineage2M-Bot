@@ -12,12 +12,12 @@ import os
 from ..utils.logger import get_logger
 from ..utils.config import config_manager
 
-# Try to import EasyOCR (optional)
+# Try to import Tesseract OCR (optional)
 try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
+    import pytesseract
+    TESSERACT_AVAILABLE = True
 except ImportError:
-    EASYOCR_AVAILABLE = False
+    TESSERACT_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -49,15 +49,15 @@ class TemplateMatcher:
         self.scales = np.linspace(0.5, 2.0, 20)  # Default scales to try
         self.pad = 12  # Padding around detected region for OCR
         
-        # OCR reader (lazy initialization)
+        # OCR reader (lazy initialization - using Tesseract instead of EasyOCR)
         self._ocr_reader = None
         
         # Ensure templates directory exists
         self.templates_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Template matcher initialized with templates directory: {self.templates_dir}")
-        if not EASYOCR_AVAILABLE:
-            logger.warning("EasyOCR not available. OCR features will be disabled. Install with: pip install easyocr")
+        if not TESSERACT_AVAILABLE:
+            logger.warning("Tesseract not available. OCR features will be disabled. Install with: pip install pytesseract")
     
     def load_template(self, template_name: str) -> Optional[np.ndarray]:
         """
@@ -380,13 +380,13 @@ class TemplateMatcher:
         return sorted(templates)
     
     def _get_ocr_reader(self):
-        """Get shared EasyOCR reader (to avoid multiple instances)"""
-        if not EASYOCR_AVAILABLE:
+        """Get shared Tesseract OCR reader (to avoid multiple instances)"""
+        if not TESSERACT_AVAILABLE:
             return None
         
-        # Use shared OCR reader singleton instead of creating new instance
-        from ..utils.ocr_reader import shared_ocr_reader
-        return shared_ocr_reader.get_reader()
+        # Use shared Tesseract OCR reader singleton
+        from ..utils.tesseract_ocr import get_tesseract_reader
+        return get_tesseract_reader(lang='eng')
     
     def find_template_and_extract_text(self,
                                       screenshot: np.ndarray,
@@ -456,16 +456,19 @@ class TemplateMatcher:
                 'bbox': (x1, y1, x2, y2)
             }
         
-        # Extract text using EasyOCR
+        # Extract text using Tesseract OCR (like the sample code)
         text = None
         text_confidence = None
         
         reader = self._get_ocr_reader()
         if reader:
             try:
-                # Convert BGR to RGB for EasyOCR
-                rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                results = reader.readtext(rgb, detail=1, paragraph=False)
+                # Preprocess for better OCR (like the sample code)
+                gray_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+                gray_crop = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                
+                # Extract text using Tesseract
+                results = reader.readtext(gray_crop, detail=1, paragraph=False)
                 
                 if results:
                     texts = []
@@ -475,7 +478,7 @@ class TemplateMatcher:
                         confidences.append(conf)
                     
                     text = " ".join(texts).strip()
-                    text_confidence = float(np.mean(confidences))
+                    text_confidence = float(np.mean(confidences)) if confidences else None
                     
                     logger.debug(f"Extracted text from {template_name}: '{text}' (confidence: {text_confidence:.3f})")
             except Exception as e:
@@ -515,9 +518,12 @@ class TemplateMatcher:
             return None
         
         try:
-            # Convert BGR to RGB for EasyOCR
-            rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-            results = reader.readtext(rgb, detail=1, paragraph=False)
+            # Preprocess for better OCR (like the sample code)
+            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+            gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            
+            # Extract text using Tesseract
+            results = reader.readtext(gray, detail=1, paragraph=False)
             
             if results:
                 texts = []

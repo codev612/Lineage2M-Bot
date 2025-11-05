@@ -111,6 +111,7 @@ class GameDetector:
         Returns:
             Dictionary containing game state information
         """
+        screenshot = None
         try:
             screenshot = self.adb.take_screenshot()
             if screenshot is None:
@@ -120,6 +121,9 @@ class GameDetector:
                     'screenshot_taken': False
                 }
             
+            # Store screen size before processing (screenshot will be deleted)
+            screen_size = screenshot.shape[:2]
+            
             # Check for "Tap screen" text first (common game startup state)
             tap_screen_detected = self._detect_tap_screen_text(screenshot)
             
@@ -127,7 +131,7 @@ class GameDetector:
             state = {
                 'status': 'select_server' if tap_screen_detected else 'unknown',
                 'screenshot_taken': True,
-                'screen_size': screenshot.shape[:2],
+                'screen_size': screen_size,
                 'timestamp': self._get_current_timestamp(),
                 'message': 'Screenshot captured successfully',
                 'tap_screen_detected': tap_screen_detected
@@ -136,19 +140,13 @@ class GameDetector:
             # If "Tap screen" is detected, we're in server selection state
             if tap_screen_detected:
                 logger.info("'Tap screen' text detected - game is in server selection state")
-                # Release screenshot after processing
-                del screenshot
                 return state
             
             # Analyze screenshot for game elements
             game_elements = self._analyze_screenshot(screenshot)
             state.update(game_elements)
             
-            # Release screenshot after processing
-            del screenshot
-            
             return state
-            
         except Exception as e:
             logger.error(f"Error detecting game state: {e}")
             return {
@@ -156,10 +154,24 @@ class GameDetector:
                 'message': f'Error detecting game state: {e}',
                 'screenshot_taken': False
             }
+        finally:
+            # Always release screenshot after processing
+            if screenshot is not None:
+                del screenshot
+                # Force garbage collection to immediately free memory
+                import gc
+                gc.collect(0)  # Quick collection of generation 0
+                # Clear GPU cache if available
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
     
     def _detect_tap_screen_text(self, screenshot: np.ndarray) -> bool:
         """
-        Detect "Tap screen" text on screenshot using OCR
+        Detect "Tap screen" text on screenshot using Tesseract OCR
         
         Args:
             screenshot: OpenCV image array
@@ -168,59 +180,51 @@ class GameDetector:
             True if "Tap screen" text is detected, False otherwise
         """
         try:
-            # Try to import EasyOCR
-            try:
-                import easyocr
-            except ImportError:
-                logger.debug("EasyOCR not available for 'Tap screen' detection")
-                return False
-            
-            # Use shared OCR reader to avoid multiple instances
-            from ..utils.ocr_reader import shared_ocr_reader
-            ocr_reader = shared_ocr_reader.get_reader()
+            # Use Tesseract OCR reader (lightweight, ~100MB vs ~2GB for EasyOCR)
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
             if ocr_reader is None:
+                logger.debug("Tesseract OCR not available for 'Tap screen' detection")
                 return False
             
-            # Downsample image for OCR to reduce memory usage (OCR doesn't need full resolution)
-            # Resize to max 1920x1080 while maintaining aspect ratio
-            height, width = screenshot.shape[:2]
-            max_dimension = 1920
-            if max(height, width) > max_dimension:
-                scale = max_dimension / max(height, width)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                screenshot_resized = cv2.resize(screenshot, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            else:
-                screenshot_resized = screenshot
-            
-            # Convert BGR to RGB for EasyOCR
-            rgb_image = cv2.cvtColor(screenshot_resized, cv2.COLOR_BGR2RGB)
-            
-            # Perform OCR on the resized screenshot
-            # Use paragraph=False to get individual text detections
-            results = ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
-            
-            # Search for "Tap screen" or variations
-            tap_screen_variations = [
-                'tap screen',
-                'tap to screen',
-                'tap the screen',
-                'tap screen to',
-                'tap',
-                'tap to start',
-                'tap to begin'
-            ]
-            
-            for (bbox, text, confidence) in results:
-                text_lower = text.lower().strip()
-                # Check if any variation matches
-                for variation in tap_screen_variations:
-                    if variation in text_lower:
-                        logger.info(f"Detected 'Tap screen' text: '{text}' (confidence: {confidence:.3f})")
-                        return True
-            
-            logger.debug("'Tap screen' text not detected in screenshot")
-            return False
+            # Process image at full device resolution (no downsampling)
+            # This ensures coordinates match device dimensions exactly
+            results = None
+            try:
+                # Perform OCR on full resolution screenshot (Tesseract works with BGR directly)
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                
+                # Search for "Tap screen" or variations
+                tap_screen_variations = [
+                    'tap screen',
+                    'tap to screen',
+                    'tap the screen',
+                    'tap screen to',
+                    'tap',
+                    'tap to start',
+                    'tap to begin'
+                ]
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if any variation matches
+                    for variation in tap_screen_variations:
+                        if variation in text_lower:
+                            logger.info(f"Detected 'Tap screen' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    logger.debug("'Tap screen' text not detected in screenshot")
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
             
         except Exception as e:
             logger.debug(f"Error detecting 'Tap screen' text: {e}")
@@ -244,12 +248,16 @@ class GameDetector:
         }
         
         try:
+            # Process at full device resolution for accurate analysis
+            # No downsampling - use full resolution screenshot
+            screenshot_small = screenshot
+            
             # Convert to different color spaces for analysis
-            hsv_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2HSV)
-            gray_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
+            hsv_image = cv2.cvtColor(screenshot_small, cv2.COLOR_BGR2HSV)
+            gray_image = cv2.cvtColor(screenshot_small, cv2.COLOR_BGR2GRAY)
             
             # Analyze dominant colors
-            analysis['colors'] = self._analyze_colors(screenshot)
+            analysis['colors'] = self._analyze_colors(screenshot_small)
             
             # Detect UI elements (basic edge detection)
             edges = cv2.Canny(gray_image, 50, 150)
@@ -260,7 +268,19 @@ class GameDetector:
             analysis['ui_elements'] = len(significant_contours)
             
             # Basic game state detection based on colors and layout
-            analysis['menu_state'] = self._detect_menu_state(screenshot, hsv_image)
+            analysis['menu_state'] = self._detect_menu_state(screenshot_small, hsv_image)
+            
+            # Release temporary images explicitly
+            if screenshot_small is not None and screenshot_small is not screenshot:
+                del screenshot_small
+            if hsv_image is not None:
+                del hsv_image
+            if gray_image is not None:
+                del gray_image
+            if edges is not None:
+                del edges
+            if contours is not None:
+                del contours
             
         except Exception as e:
             logger.warning(f"Error analyzing screenshot: {e}")

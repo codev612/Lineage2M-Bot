@@ -59,8 +59,8 @@ class MainWindow(GUIEventHandlers):
         
         # Threading
         self.message_queue = queue.Queue()
-        # Limit screenshot queue to prevent memory buildup (max 3 screenshots)
-        self.screenshot_queue = queue.Queue(maxsize=3)
+        # Limit screenshot queue to prevent memory buildup (max 1 screenshot to minimize memory)
+        self.screenshot_queue = queue.Queue(maxsize=1)
         
         # Create GUI
         self._setup_gui()
@@ -76,6 +76,9 @@ class MainWindow(GUIEventHandlers):
         
         # Update region tab device list after devices are loaded (with delay to ensure GUI is ready)
         self.root.after(2000, self._update_region_device_list)
+        
+        # Memory monitoring disabled
+        # self.root.after(3000, self._start_memory_monitoring)
         
         logger.info("GUI initialized successfully")
     
@@ -546,29 +549,76 @@ class MainWindow(GUIEventHandlers):
     
     def _setup_monitor_tab(self):
         """Setup the monitoring tab"""
-        # Screenshot viewer
-        screenshot_frame = ctk.CTkFrame(self.monitor_tab)
-        screenshot_frame.pack(side="left", fill="both", expand=True, padx=(10, 5), pady=10)
+        # Create main container with two columns
+        main_container = ctk.CTkFrame(self.monitor_tab)
+        main_container.pack(fill="both", expand=True, padx=10, pady=10)
         
-        screenshot_label = ctk.CTkLabel(
-            screenshot_frame,
-            text="📸 Live Screenshot",
+        # Left column: Memory Monitor
+        left_column = ctk.CTkFrame(main_container)
+        left_column.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        
+        # Memory monitor section
+        memory_frame = ctk.CTkFrame(left_column)
+        memory_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        memory_label = ctk.CTkLabel(
+            memory_frame,
+            text="💾 Real-Time Memory Usage",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        screenshot_label.pack(pady=10)
+        memory_label.pack(pady=10)
         
-        # Screenshot display
-        self.screenshot_canvas = tk.Canvas(
-            screenshot_frame,
-            bg="black",
-            width=300,
-            height=400
+        # Memory display text area
+        self.memory_display = ctk.CTkTextbox(
+            memory_frame,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            height=200
         )
-        self.screenshot_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.memory_display.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         
-        # Log viewer
-        log_frame = ctk.CTkFrame(self.monitor_tab)
-        log_frame.pack(side="right", fill="both", expand=True, padx=(5, 10), pady=10)
+        # Show disabled message
+        disabled_msg = """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Memory Monitor Disabled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Memory monitoring has been disabled to reduce
+resource usage and improve performance.
+
+Memory monitoring functionality is currently
+unavailable.
+"""
+        self.memory_display.insert("1.0", disabled_msg)
+        
+        # Memory control buttons
+        memory_buttons = ctk.CTkFrame(memory_frame)
+        memory_buttons.pack(fill="x", padx=10, pady=(0, 10))
+        
+        gc_button = ctk.CTkButton(
+            memory_buttons,
+            text="🗑️ Force GC",
+            command=self._force_garbage_collection,
+            width=120
+        )
+        gc_button.pack(side="left", padx=5)
+        
+        refresh_button = ctk.CTkButton(
+            memory_buttons,
+            text="🔄 Refresh Now",
+            command=self._refresh_memory_display,
+            width=120
+        )
+        refresh_button.pack(side="left", padx=5)
+        
+        test_button = ctk.CTkButton(
+            memory_buttons,
+            text="🧪 Test Display",
+            command=self._test_memory_display,
+            width=120
+        )
+        test_button.pack(side="left", padx=5)
+        
+        # Right column: Log viewer
+        log_frame = ctk.CTkFrame(main_container)
+        log_frame.pack(side="right", fill="both", expand=True, padx=(5, 0))
         
         log_label = ctk.CTkLabel(
             log_frame,
@@ -1500,7 +1550,9 @@ class MainWindow(GUIEventHandlers):
                                     # Assign a default color for custom types
                                     self.region_canvas.region_colors[region_type] = "#ff00ff"  # Magenta
                             
-                            logger.info(f"Loaded custom region type from file: {region_type} ({label})")
+                            # Remove emojis from label for logging (Windows encoding compatibility)
+                            label_clean = label.encode('ascii', 'ignore').decode('ascii') if label else label
+                            logger.info(f"Loaded custom region type from file: {region_type} ({label_clean})")
                 
                 except Exception as e:
                     logger.debug(f"Error loading custom region types from file: {e}")
@@ -1640,6 +1692,176 @@ class MainWindow(GUIEventHandlers):
             width=140
         ).pack(side="left", padx=5, pady=5)
     
+    def _start_memory_monitoring(self):
+        """Start memory monitoring (DISABLED)"""
+        # Memory monitoring is disabled
+        if hasattr(self, 'memory_display') and self.memory_display:
+            disabled_msg = """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Memory Monitor Disabled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Memory monitoring has been disabled to reduce
+resource usage and improve performance.
+
+Memory monitoring functionality is currently
+unavailable.
+"""
+            self.root.after(0, lambda: self._update_memory_text(disabled_msg))
+        logger.debug("Memory monitoring is disabled")
+    
+    def _update_memory_display(self, memory_info: Dict):
+        """Update memory display in GUI (called from memory monitor thread)"""
+        try:
+            if not hasattr(self, 'memory_display') or not self.memory_display:
+                logger.debug("Memory display widget not available")
+                return
+            
+            if not memory_info:
+                logger.debug("Memory info is empty")
+                return
+            
+            # Format memory information
+            breakdown = memory_info.get('breakdown', {})
+            
+            display_text = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Process Memory: {memory_info['process_memory_mb']:.1f} MB ({memory_info['process_memory_gb']:.2f} GB)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+System Memory: {memory_info['system_used_mb']:.1f} MB / {memory_info['system_total_mb']:.1f} MB
+System Usage: {memory_info['system_percent']:.1f}%
+Available: {memory_info['system_available_mb']:.1f} MB
+
+Major Components:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EasyOCR: {breakdown.get('easyocr_mb', 0):.1f} MB ({'✓' if breakdown.get('component_details', {}).get('easyocr_loaded') else '✗'})
+NumPy Arrays: {breakdown.get('numpy_arrays_mb', 0):.1f} MB ({breakdown.get('numpy_array_count', 0)} arrays)
+PIL Images: {breakdown.get('pil_images_mb', 0):.1f} MB ({breakdown.get('pil_image_count', 0)} images)
+GC Collections: {breakdown.get('gc_collections', 0)} total ({breakdown.get('gc_details', {}).get('collections_per_second', 0):.2f}/sec)
+Total Objects: {breakdown.get('total_objects', 0)}
+
+Top Memory Consumers (by size):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            
+            # Add top object types by size
+            top_by_size = breakdown.get('top_object_types_by_size', {})
+            if top_by_size:
+                for obj_type, size_mb in list(top_by_size.items())[:5]:
+                    display_text += f"\n  • {obj_type}: {size_mb:.2f} MB"
+            else:
+                display_text += "\n  (No data)"
+            
+            # Add large arrays warning
+            component_details = breakdown.get('component_details', {})
+            if 'large_numpy_arrays' in component_details:
+                large_arrays = component_details['large_numpy_arrays']
+                if len(large_arrays) > 0:
+                    display_text += f"\n\n⚠️ Large Arrays (>1MB): {len(large_arrays)}"
+                    for arr_info in large_arrays[:3]:  # Show top 3
+                        display_text += f"\n  • {arr_info['size_mb']:.1f}MB - {arr_info['shape']}"
+            
+            # Add tracemalloc top consumers
+            tracemalloc_info = breakdown.get('tracemalloc', {})
+            if tracemalloc_info and tracemalloc_info.get('top_consumers'):
+                display_text += "\n\nTop Allocations:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                for consumer in tracemalloc_info['top_consumers'][:3]:
+                    filename = consumer['file'].split('/')[-1] if '/' in consumer['file'] else consumer['file'].split('\\')[-1]
+                    display_text += f"\n  • {filename}:{consumer['line']} - {consumer['size_mb']:.2f}MB"
+            
+            # Add GC warning if high rate
+            gc_details = breakdown.get('gc_details', {})
+            if gc_details.get('warning'):
+                display_text += f"\n\n⚠️ GC WARNING:\n{gc_details['warning']}"
+            
+            # Add GC generation details
+            if gc_details.get('collections_by_generation'):
+                display_text += "\n\nGC Details:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                for gen_name, gen_stats in gc_details['collections_by_generation'].items():
+                    display_text += f"\n  {gen_name}: {gen_stats['collections']} collections"
+                    if gen_stats.get('collected', 0) > 0:
+                        display_text += f", {gen_stats['collected']} objects collected"
+            
+            # Add potential leak warning
+            if 'potential_leak' in breakdown:
+                display_text += f"\n\n⚠️ MEMORY LEAK WARNING:\n{breakdown['potential_leak']}"
+            
+            # Update display in main thread
+            self.root.after(0, lambda text=display_text: self._update_memory_text(text))
+        
+        except Exception as e:
+            logger.error(f"Error updating memory display: {e}", exc_info=True)
+            # Show error in display
+            error_text = f"Error updating memory display:\n{str(e)}\n\nTrying to refresh..."
+            self.root.after(0, lambda: self._update_memory_text(error_text))
+    
+    def _update_memory_text(self, text: str):
+        """Update memory text widget (must be called from main thread)"""
+        try:
+            if hasattr(self, 'memory_display') and self.memory_display:
+                self.memory_display.delete("1.0", "end")
+                self.memory_display.insert("1.0", text)
+                logger.debug(f"Memory display updated: {len(text)} characters")
+            else:
+                logger.warning("Memory display widget not found")
+        except Exception as e:
+            logger.error(f"Error updating memory text: {e}", exc_info=True)
+    
+    def _refresh_memory_display(self):
+        """Manually refresh memory display (DISABLED)"""
+        disabled_msg = "Memory monitoring is disabled."
+        self._update_memory_text(disabled_msg)
+        logger.debug("Memory monitoring refresh requested but monitoring is disabled")
+    
+    def _test_memory_display(self):
+        """Test if memory display is working"""
+        try:
+            test_text = """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TEST: Memory Display Working
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If you can see this, the display is working.
+
+Process Memory: TESTING...
+System Memory: TESTING...
+
+This is a test message.
+"""
+            self._update_memory_text(test_text)
+            logger.info("Test memory display executed")
+        except Exception as e:
+            logger.error(f"Error in test memory display: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Memory display test failed: {e}")
+    
+    def _force_garbage_collection(self):
+        """Force garbage collection"""
+        try:
+            import gc
+            collected = gc.collect()
+            logger.info(f"Forced garbage collection: {collected} objects collected")
+            messagebox.showinfo("Success", f"Garbage collection completed.\n{collected} objects collected.")
+        except Exception as e:
+            logger.error(f"Error forcing garbage collection: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Error forcing garbage collection: {e}")
+    
+    def _reload_config(self):
+        """Reload configuration display"""
+        self._load_config_display()
+    
+    def _save_config(self):
+        """Save configuration (placeholder)"""
+        messagebox.showinfo("Info", "Configuration saving not yet implemented")
+    
+    def _open_config_file(self):
+        """Open configuration file in system editor"""
+        try:
+            import os
+            import subprocess
+            config_file = Path("config/bot_config.yaml")
+            if config_file.exists():
+                if os.name == 'nt':  # Windows
+                    os.startfile(str(config_file))
+                elif os.name == 'posix':  # macOS and Linux
+                    subprocess.call(['open' if sys.platform == 'darwin' else 'xdg-open', str(config_file)])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open config file: {e}")
+    
+    
     def _setup_menu(self):
         """Setup the menu bar"""
         menubar = tk.Menu(self.root)
@@ -1702,8 +1924,8 @@ class MainWindow(GUIEventHandlers):
                             screenshot = self.screenshot_queue.get_nowait()
                         
                         if screenshot is not None:
-                            self._update_screenshot_display(screenshot)
-                            del screenshot  # Release after display
+                            # Live screenshot display removed - just release the screenshot
+                            del screenshot  # Release after processing
                     except Exception as e:
                         logger.debug(f"Error processing screenshot queue: {e}")
                     

@@ -360,7 +360,7 @@ class ADBManager:
             # Load image with OpenCV
             opencv_image = cv2.imread(local_path)
             
-            # Clean up temp files
+            # Clean up temp files immediately
             subprocess.run(['adb', '-s', self.device_id, 'shell', 'rm', temp_path], 
                          capture_output=True, timeout=5)
             
@@ -368,6 +368,8 @@ class ADBManager:
             if not save_path and os.path.exists(local_path):
                 os.remove(local_path)
             
+            # Return screenshot at full device resolution (no downsampling)
+            # This ensures all processing uses the same dimensions as the device
             return opencv_image
             
         except Exception as e:

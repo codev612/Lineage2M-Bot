@@ -54,11 +54,12 @@ class RegionCanvas:
         self.frame.grid_columnconfigure(0, weight=1)
         self.frame.grid_rowconfigure(0, weight=1)
         
-        # Current screenshot
+        # Current screenshot (store as numpy array, convert to PIL only when needed)
         self.current_screenshot = None
-        self.screenshot_image = None
+        self.original_screenshot = None  # Store original as numpy array (more efficient)
+        self.screenshot_image = None  # PhotoImage for display
         self.canvas_image_id = None
-        self.original_pil_image = None  # Store original PIL image for zooming
+        self.original_pil_image = None  # Lazy-loaded PIL image for zooming
         
         # Zoom state
         self.zoom_level = 1.0  # Current zoom level (1.0 = 100%)
@@ -114,28 +115,40 @@ class RegionCanvas:
     def load_screenshot(self, screenshot: np.ndarray):
         """Load a screenshot (numpy array) onto the canvas"""
         try:
+            # Release old screenshots and images if exist (before storing new ones)
+            if self.current_screenshot is not None:
+                del self.current_screenshot
+            if self.original_screenshot is not None:
+                del self.original_screenshot
+            if self.original_pil_image is not None:
+                del self.original_pil_image
+            if self.screenshot_image is not None:
+                # PhotoImage will be released when canvas deletes the image
+                self.screenshot_image = None
+            
             # Convert BGR to RGB
             if len(screenshot.shape) == 3:
                 rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
             else:
                 rgb_image = screenshot
             
-            # Convert to PIL Image
-            pil_image = Image.fromarray(rgb_image)
-            
-            # Store original PIL image for zooming
-            self.original_pil_image = pil_image.copy()
+            # Store original numpy array (more memory efficient than PIL)
+            # We'll convert to PIL only when needed for display/zooming
+            self.original_screenshot = rgb_image.copy() if rgb_image is not None else None
             
             # Store original size
-            self.original_width = pil_image.width
-            self.original_height = pil_image.height
+            self.original_height, self.original_width = rgb_image.shape[:2]
+            
+            # Don't convert to PIL immediately - do it lazily when needed for display
+            # This saves memory if screenshot is loaded but not displayed
+            self.original_pil_image = None
             
             # Reset zoom level when loading new screenshot
             self.zoom_level = 1.0
             
             # Calculate initial scale to fit canvas while maintaining aspect ratio
-            scale_w = self.width / pil_image.width
-            scale_h = self.height / pil_image.height
+            scale_w = self.width / self.original_width
+            scale_h = self.height / self.original_height
             self.base_scale = min(scale_w, scale_h, 1.0)  # Don't scale up beyond original
             
             # Apply zoom to base scale
@@ -144,15 +157,12 @@ class RegionCanvas:
             # Clear canvas
             self.canvas.delete("all")
             
+            # Store screenshot for reference (numpy array, more efficient)
+            # Note: We keep the original numpy array, not the RGB copy
+            self.current_screenshot = screenshot
+            
             # Update image display with current zoom
             self._update_image_display()
-            
-            # Release old screenshot if exists
-            if self.current_screenshot is not None:
-                del self.current_screenshot
-            
-            # Store screenshot for reference
-            self.current_screenshot = screenshot
             
             # Redraw regions
             self._redraw_regions()
@@ -432,18 +442,30 @@ class RegionCanvas:
     
     def _update_image_display(self):
         """Update the displayed image with current zoom level"""
-        if self.original_pil_image is None:
+        if self.original_screenshot is None:
             return
         
         # Calculate new size with current zoom
         new_width = int(self.original_width * self.scale)
         new_height = int(self.original_height * self.scale)
         
+        # Convert numpy array to PIL only when needed (more memory efficient)
+        if self.original_pil_image is None and self.original_screenshot is not None:
+            self.original_pil_image = Image.fromarray(self.original_screenshot)
+        
         # Resize image
         resized_image = self.original_pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
         
+        # Release old PhotoImage if exists
+        if hasattr(self, 'screenshot_image') and self.screenshot_image is not None:
+            # PhotoImage will be garbage collected when canvas no longer references it
+            pass
+        
         # Convert to PhotoImage
         self.screenshot_image = ImageTk.PhotoImage(resized_image)
+        
+        # Release resized PIL image immediately after PhotoImage creation
+        del resized_image
         
         # Update canvas image
         if self.canvas_image_id:

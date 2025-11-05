@@ -53,7 +53,7 @@ class GameAutomation:
         # Game state tracking
         self.current_state = 'unknown'
         self.last_action_time = 0
-        self.action_interval = 2.0  # Minimum time between actions (seconds)
+        self.action_interval = 5.0  # Minimum time between actions (seconds) - increased to reduce CPU
         
         # Retry tracking for each step
         self.step_retry_count = {}  # Dictionary to track retry count per step
@@ -78,6 +78,11 @@ class GameAutomation:
         # Last action tracking
         self.last_action = None
         
+        # Screenshot caching to avoid multiple screenshots per loop
+        self._last_screenshot = None
+        self._last_screenshot_time = 0
+        self._screenshot_cache_ttl = 0.5  # Cache screenshots for 0.5 seconds only (reduced to minimize memory usage)
+        
     def start(self):
         """Start the game automation"""
         if self.running:
@@ -99,8 +104,15 @@ class GameAutomation:
         self.running = False
         self.action_queue.clear()
         
+        # Clear screenshot cache to free memory
+        if self._last_screenshot is not None:
+            del self._last_screenshot
+            self._last_screenshot = None
+            self._last_screenshot_time = 0
+        
     def _detect_screen_size(self):
         """Detect device screen dimensions"""
+        screenshot = None
         try:
             screenshot = self.adb.take_screenshot()
             if screenshot is not None:
@@ -122,6 +134,10 @@ class GameAutomation:
             # Default fallback
             self.screen_width = 1080
             self.screen_height = 1920
+        finally:
+            # Always release screenshot
+            if screenshot is not None:
+                del screenshot
     
     def _check_and_reset_retry(self, step_name: str) -> bool:
         """
@@ -183,6 +199,14 @@ class GameAutomation:
                     else:
                         # Success - reset retry counter
                         self._reset_retry(step_name)
+                        
+                        # After game launch, actively wait for "Tap screen" to appear with periodic checks
+                        # Using longer interval (10s) to reduce CPU and memory usage
+                        logger.info("Game is running, waiting for 'Tap screen' text to appear...")
+                        if self._wait_for_tap_screen_text(max_wait_time=60.0, check_interval=10.0):
+                            logger.info("'Tap screen' text detected after game launch")
+                        else:
+                            logger.debug("'Tap screen' text not detected yet, will check in next loop iteration")
                 else:
                     if not self._check_and_reset_retry(step_name):
                         return  # Bot stopped due to max retries
@@ -236,9 +260,11 @@ class GameAutomation:
             game_state = self.game_detector.detect_game_state()
             self.current_state = game_state.get('status', 'unknown')
             
-            # Release screenshot from game_state if it exists (to free memory)
+            # Don't cache screenshot from game_state - it's already processed
+            # Delete it immediately to free memory (don't keep duplicate references)
             if 'screenshot' in game_state:
                 del game_state['screenshot']
+                gc.collect(0)  # Force GC after deleting screenshot
             
             # Execute appropriate actions based on game state
             if self.current_state == 'in_game':
@@ -269,11 +295,35 @@ class GameAutomation:
                 time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
             
             # Periodic garbage collection to free memory (every 10 loops)
+            # But only if GC hasn't run recently (avoid forcing GC too frequently)
             if not hasattr(self, '_loop_count'):
                 self._loop_count = 0
+                self._last_gc_time = 0
             self._loop_count += 1
-            if self._loop_count % 10 == 0:
-                gc.collect()
+            
+            # More aggressive GC - every 5 loops AND at least 3 seconds since last GC
+            current_time = time.time()
+            if self._loop_count % 5 == 0 and (current_time - self._last_gc_time) > 3.0:
+                # Always clear screenshot cache before GC to ensure old screenshots are released
+                if self._last_screenshot is not None:
+                    # Check if cache is old (more than TTL)
+                    if (current_time - self._last_screenshot_time) > self._screenshot_cache_ttl:
+                        del self._last_screenshot
+                        self._last_screenshot = None
+                
+                # Force more aggressive garbage collection
+                gc.collect(0)  # Collect generation 0
+                gc.collect(1)  # Also collect generation 1 for better cleanup
+                self._last_gc_time = current_time
+                
+                # Clear GPU cache if using GPU (PyTorch CUDA cache)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()  # Clear GPU cache to free VRAM
+                        torch.cuda.synchronize()  # Ensure all GPU operations are complete
+                except:
+                    pass
                 
         except Exception as e:
             step_name = "game_loop_error"
@@ -348,6 +398,75 @@ class GameAutomation:
             logger.error(f"Error launching game: {e}", exc_info=True)
             return False
     
+    def _wait_for_tap_screen_text(self, max_wait_time: float = 60.0, check_interval: float = 10.0) -> bool:
+        """
+        Wait for "Tap screen" text to appear and tap it (blocking wait with periodic checks)
+        
+        Args:
+            max_wait_time: Maximum time to wait in seconds (default: 60)
+            check_interval: Interval between checks in seconds (default: 2.0)
+            
+        Returns:
+            True if "Tap screen" was detected and tapped, False otherwise
+        """
+        try:
+            start_time = time.time()
+            check_count = 0
+            
+            logger.info(f"Waiting for 'Tap screen' text to appear (max {max_wait_time}s, checking every {check_interval}s)...")
+            
+            while time.time() - start_time < max_wait_time:
+                check_count += 1
+                elapsed = time.time() - start_time
+                
+                # Check for "Tap screen" text (with reduced frequency to save CPU)
+                if self._check_and_tap_tap_screen():
+                    logger.info(f"'Tap screen' detected and tapped after {elapsed:.1f}s (check #{check_count})")
+                    return True
+                
+                # Log progress every 15 seconds (reduced logging frequency)
+                if check_count % (int(15 / check_interval)) == 0:
+                    logger.debug(f"Still waiting for 'Tap screen' text... ({elapsed:.1f}s elapsed, check #{check_count})")
+                
+                # Wait before next check
+                time.sleep(check_interval)
+            
+            elapsed = time.time() - start_time
+            logger.debug(f"'Tap screen' text not detected within {max_wait_time} seconds (checked {check_count} times, {elapsed:.1f}s elapsed)")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error waiting for tap screen text: {e}", exc_info=True)
+            return False
+    
+    def _get_cached_screenshot(self, force_new: bool = False):
+        """
+        Get a cached screenshot or take a new one if cache is expired
+        
+        Args:
+            force_new: Force taking a new screenshot even if cache is valid
+            
+        Returns:
+            Screenshot numpy array or None
+        """
+        current_time = time.time()
+        
+        if (force_new or 
+            self._last_screenshot is None or 
+            (current_time - self._last_screenshot_time) > self._screenshot_cache_ttl):
+            # Cache expired or forced, take new screenshot
+            # Delete old screenshot before taking new one to free memory
+            if self._last_screenshot is not None:
+                del self._last_screenshot
+                self._last_screenshot = None
+                # Force immediate garbage collection after deleting screenshot
+                gc.collect(0)
+            
+            self._last_screenshot = self.adb.take_screenshot()
+            self._last_screenshot_time = current_time
+        
+        return self._last_screenshot
+    
     def _check_and_tap_tap_screen(self) -> bool:
         """
         Check for "Tap screen" text or image and tap if found (non-blocking single check)
@@ -356,70 +475,74 @@ class GameAutomation:
             True if "Tap screen" was detected and tapped, False otherwise
         """
         try:
-            # Take screenshot
-            screenshot = self.adb.take_screenshot()
+            # Use cached screenshot to avoid multiple screenshots per loop
+            screenshot = self._get_cached_screenshot()
             if screenshot is None:
                 return False
             
-            # Check for "Tap screen" text using OCR
-            tap_screen_detected = self.game_detector._detect_tap_screen_text(screenshot)
-            
-            if tap_screen_detected:
-                logger.info("'Tap screen' text detected, attempting to find position and tap...")
-                
-                # Try to find tap screen position using OCR results
-                tap_position = self._find_tap_screen_position(screenshot)
-                
-                if tap_position:
-                    x, y = tap_position
-                    logger.info(f"Tapping at detected position: ({x}, {y})")
-                    self.adb.tap(x, y)
-                    
-                    if STATE_MONITOR_AVAILABLE and self.device_id:
-                        device_state_monitor.update_game_state(
-                            self.device_id,
-                            action="tap_screen"
-                        )
-                    
-                    return True
-                else:
-                    # If text detected but position not found, tap center of screen
-                    logger.info("'Tap screen' text detected but position not found, tapping center of screen")
-                    center_x = self.screen_width // 2 if self.screen_width > 0 else 540
-                    center_y = self.screen_height // 2 if self.screen_height > 0 else 960
-                    self.adb.tap(center_x, center_y)
-                    
-                    if STATE_MONITOR_AVAILABLE and self.device_id:
-                        device_state_monitor.update_game_state(
-                            self.device_id,
-                            action="tap_screen_center"
-                        )
-                    
-                    return True
-            
-            # Also check for "Tap screen" image template if available
             try:
-                from ..utils.template_matcher import TemplateMatcher
-                template_matcher = TemplateMatcher()
+                # Check for "Tap screen" text using OCR
+                tap_screen_detected = self.game_detector._detect_tap_screen_text(screenshot)
                 
-                # Try to find "tap_screen" template
-                tap_result = template_matcher.find_template(screenshot, "tap_screen.png", multi_scale=True)
-                if tap_result:
-                    x, y, confidence = tap_result
-                    logger.info(f"'Tap screen' image detected at ({x}, {y}) with confidence {confidence:.3f}, tapping...")
-                    self.adb.tap(x, y)
+                if tap_screen_detected:
+                    logger.info("'Tap screen' text detected, attempting to find position and tap...")
                     
-                    if STATE_MONITOR_AVAILABLE and self.device_id:
-                        device_state_monitor.update_game_state(
-                            self.device_id,
-                            action="tap_screen_image"
-                        )
+                    # Try to find tap screen position using OCR results
+                    tap_position = self._find_tap_screen_position(screenshot)
                     
-                    return True
-            except Exception as e:
-                logger.debug(f"Template matching for tap screen failed: {e}")
-            
-            return False
+                    if tap_position:
+                        x, y = tap_position
+                        logger.info(f"Tapping at detected position: ({x}, {y})")
+                        self.adb.tap(x, y)
+                        
+                        if STATE_MONITOR_AVAILABLE and self.device_id:
+                            device_state_monitor.update_game_state(
+                                self.device_id,
+                                action="tap_screen"
+                            )
+                        
+                        return True
+                    else:
+                        # If text detected but position not found, tap center of screen
+                        logger.info("'Tap screen' text detected but position not found, tapping center of screen")
+                        center_x = self.screen_width // 2 if self.screen_width > 0 else 540
+                        center_y = self.screen_height // 2 if self.screen_height > 0 else 960
+                        self.adb.tap(center_x, center_y)
+                        
+                        if STATE_MONITOR_AVAILABLE and self.device_id:
+                            device_state_monitor.update_game_state(
+                                self.device_id,
+                                action="tap_screen_center"
+                            )
+                        
+                        return True
+                
+                # Also check for "Tap screen" image template if available
+                try:
+                    from ..utils.template_matcher import TemplateMatcher
+                    template_matcher = TemplateMatcher()
+                    
+                    # Try to find "tap_screen" template
+                    tap_result = template_matcher.find_template(screenshot, "tap_screen.png", multi_scale=True)
+                    if tap_result:
+                        x, y, confidence = tap_result
+                        logger.info(f"'Tap screen' image detected at ({x}, {y}) with confidence {confidence:.3f}, tapping...")
+                        self.adb.tap(x, y)
+                        
+                        if STATE_MONITOR_AVAILABLE and self.device_id:
+                            device_state_monitor.update_game_state(
+                                self.device_id,
+                                action="tap_screen_image"
+                            )
+                        
+                        return True
+                except Exception as e:
+                    logger.debug(f"Template matching for tap screen failed: {e}")
+                
+                return False
+            finally:
+                # Don't delete screenshot here - it's cached and will be reused
+                pass
             
         except Exception as e:
             logger.debug(f"Error checking tap screen: {e}")
@@ -448,35 +571,41 @@ class GameAutomation:
             while time.time() - start_time < max_wait_time:
                 check_count += 1
                 elapsed = time.time() - start_time
+                screenshot = None
                 
-                # Take screenshot
-                screenshot = self.adb.take_screenshot()
-                if screenshot is None:
-                    logger.debug(f"Could not take screenshot for enter button detection (check #{check_count}, {elapsed:.1f}s elapsed)")
-                    time.sleep(check_interval)
-                    continue
-                
-                # Try to find enter_button.png template
                 try:
-                    enter_result = template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
-                    if enter_result:
-                        x, y, confidence = enter_result
-                        logger.info(f"[OK] enter_button.png detected at ({x}, {y}) with confidence {confidence:.3f} (after {elapsed:.1f}s), tapping...")
-                        self.adb.tap(x, y)
-                        
-                        if STATE_MONITOR_AVAILABLE and self.device_id:
-                            device_state_monitor.update_game_state(
-                                self.device_id,
-                                action="tap_enter_button"
-                            )
-                        
-                        return True
-                    else:
-                        # Log progress every 2 seconds
-                        if check_count % 4 == 0:  # Every 2 seconds (4 checks * 0.5s)
-                            logger.debug(f"Still waiting for enter_button.png... ({elapsed:.1f}s elapsed, check #{check_count})")
-                except Exception as e:
-                    logger.debug(f"Template matching for enter button failed (check #{check_count}): {e}")
+                    # Use cached screenshot if available (within cache TTL)
+                    screenshot = self._get_cached_screenshot()
+                    if screenshot is None:
+                        logger.debug(f"Could not take screenshot for enter button detection (check #{check_count}, {elapsed:.1f}s elapsed)")
+                        time.sleep(check_interval)
+                        continue
+                    
+                    # Try to find enter_button.png template
+                    try:
+                        enter_result = template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
+                        if enter_result:
+                            x, y, confidence = enter_result
+                            logger.info(f"[OK] enter_button.png detected at ({x}, {y}) with confidence {confidence:.3f} (after {elapsed:.1f}s), tapping...")
+                            self.adb.tap(x, y)
+                            
+                            if STATE_MONITOR_AVAILABLE and self.device_id:
+                                device_state_monitor.update_game_state(
+                                    self.device_id,
+                                    action="tap_enter_button"
+                                )
+                            
+                            return True
+                        else:
+                            # Log progress every 2 seconds
+                            if check_count % 4 == 0:  # Every 2 seconds (4 checks * 0.5s)
+                                logger.debug(f"Still waiting for enter_button.png... ({elapsed:.1f}s elapsed, check #{check_count})")
+                    except Exception as e:
+                        logger.debug(f"Template matching for enter button failed (check #{check_count}): {e}")
+                finally:
+                    # Don't delete screenshot here - it's cached and will be reused
+                    # Screenshot is managed by cache system
+                    pass
                 
                 # Wait before next check
                 time.sleep(check_interval)
@@ -503,66 +632,61 @@ class GameAutomation:
             Tuple of (x, y) coordinates if found, None otherwise
         """
         try:
-            # Try to import EasyOCR
-            try:
-                import easyocr
-            except ImportError:
-                logger.debug("EasyOCR not available for position detection")
-                return None
-            
-            # Use shared OCR reader to avoid multiple instances
-            from ..utils.ocr_reader import shared_ocr_reader
-            ocr_reader = shared_ocr_reader.get_reader()
+            # Use Tesseract OCR reader (lightweight, ~100MB vs ~2GB for EasyOCR)
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
             if ocr_reader is None:
+                logger.debug("Tesseract OCR not available for position detection")
                 return None
             
-            # Downsample image for OCR to reduce memory usage
+            # Process image at full device resolution (no downsampling)
+            # This ensures coordinates match device dimensions exactly
             height, width = screenshot.shape[:2]
-            max_dimension = 1920
-            if max(height, width) > max_dimension:
-                scale = max_dimension / max(height, width)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                screenshot_resized = cv2.resize(screenshot, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            else:
-                screenshot_resized = screenshot
             
-            # Convert BGR to RGB for EasyOCR
-            rgb_image = cv2.cvtColor(screenshot_resized, cv2.COLOR_BGR2RGB)
-            
-            # Perform OCR on the resized screenshot
-            results = ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
-            
-            # Search for "Tap screen" variations
-            tap_screen_variations = [
-                'tap screen',
-                'tap to screen',
-                'tap the screen',
-                'tap screen to',
-                'tap',
-                'tap to start',
-                'tap to begin'
-            ]
-            
-            for (bbox, text, confidence) in results:
-                text_lower = text.lower().strip()
-                for variation in tap_screen_variations:
-                    if variation in text_lower:
-                        # Calculate center of bounding box
-                        # bbox is a list of 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                        if len(bbox) >= 4:
-                            # Get all x and y coordinates
-                            xs = [point[0] for point in bbox]
-                            ys = [point[1] for point in bbox]
-                            
-                            # Calculate center
-                            center_x = int(sum(xs) / len(xs))
-                            center_y = int(sum(ys) / len(ys))
-                            
-                            logger.info(f"Found 'Tap screen' text '{text}' at ({center_x}, {center_y})")
-                            return (center_x, center_y)
-            
-            return None
+            try:
+                # Perform OCR on full resolution screenshot (Tesseract works with BGR directly)
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                
+                # Search for "Tap screen" variations
+                tap_screen_variations = [
+                    'tap screen',
+                    'tap to screen',
+                    'tap the screen',
+                    'tap screen to',
+                    'tap',
+                    'tap to start',
+                    'tap to begin'
+                ]
+                
+                position = None
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    for variation in tap_screen_variations:
+                        if variation in text_lower:
+                            # Calculate center of bounding box
+                            # bbox is a list of 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                            if len(bbox) >= 4:
+                                # Get all x and y coordinates
+                                xs = [point[0] for point in bbox]
+                                ys = [point[1] for point in bbox]
+                                
+                                # Calculate center (no scaling needed - already at full resolution)
+                                center_x = int(sum(xs) / len(xs))
+                                center_y = int(sum(ys) / len(ys))
+                                
+                                logger.info(f"Found 'Tap screen' text '{text}' at ({center_x}, {center_y})")
+                                position = (center_x, center_y)
+                                break
+                    if position:
+                        break
+                
+                # Clear OCR results to free memory immediately
+                del results
+                return position
+                
+            finally:
+                # Force garbage collection after OCR
+                gc.collect(0)
             
         except Exception as e:
             logger.debug(f"Error finding tap screen position: {e}")
@@ -580,47 +704,58 @@ class GameAutomation:
             if screenshot is None:
                 return None
             
-            health_status = "healthy"
-            
-            # Analyze health bar area (typically at top of screen)
-            # Health bar is usually in top-left or top-center area
-            health_region = screenshot[0:self.screen_height//10, 0:self.screen_width//3]
-            
-            # Simple heuristic: Check if health bar area is mostly red (low health)
-            # Convert to HSV for better color detection
-            hsv_region = cv2.cvtColor(health_region, cv2.COLOR_BGR2HSV)
-            
-            # Red color range in HSV (for low health indicator)
-            lower_red = np.array([0, 100, 100])
-            upper_red = np.array([10, 255, 255])
-            
-            # Create mask for red pixels
-            red_mask = cv2.inRange(hsv_region, lower_red, upper_red)
-            red_ratio = np.sum(red_mask > 0) / (health_region.shape[0] * health_region.shape[1])
-            
-            # If significant red detected (low health), use HP potion
-            if red_ratio > 0.3:
-                logger.info("Low health detected, using HP potion...")
-                self._use_hp_potion()
-                health_status = "low_hp"
-                time.sleep(0.5)
-            
-            # Check MP (mana) - typically blue or green bar
-            # For now, we'll use a simpler approach - check overall brightness
-            mp_region = screenshot[0:self.screen_height//10, self.screen_width//3:self.screen_width*2//3]
-            mp_brightness = np.mean(cv2.cvtColor(mp_region, cv2.COLOR_BGR2GRAY))
-            
-            # If MP bar is dark (low mana), use MP potion
-            if mp_brightness < 100:
-                logger.info("Low MP detected, using MP potion...")
-                self._use_mp_potion()
-                if health_status == "healthy":
-                    health_status = "low_mp"
-                else:
-                    health_status = "low_hp_mp"
-                time.sleep(0.5)
-            
-            return health_status
+            try:
+                health_status = "healthy"
+                
+                # Analyze health bar area (typically at top of screen)
+                # Health bar is usually in top-left or top-center area
+                # Create explicit copy to avoid keeping reference to full screenshot
+                health_region = screenshot[0:self.screen_height//10, 0:self.screen_width//3].copy()
+                
+                # Simple heuristic: Check if health bar area is mostly red (low health)
+                # Convert to HSV for better color detection
+                hsv_region = cv2.cvtColor(health_region, cv2.COLOR_BGR2HSV)
+                
+                # Red color range in HSV (for low health indicator)
+                lower_red = np.array([0, 100, 100])
+                upper_red = np.array([10, 255, 255])
+                
+                # Create mask for red pixels
+                red_mask = cv2.inRange(hsv_region, lower_red, upper_red)
+                red_ratio = np.sum(red_mask > 0) / (health_region.shape[0] * health_region.shape[1])
+                
+                # Release intermediate images
+                del health_region, hsv_region, red_mask
+                
+                # If significant red detected (low health), use HP potion
+                if red_ratio > 0.3:
+                    logger.info("Low health detected, using HP potion...")
+                    self._use_hp_potion()
+                    health_status = "low_hp"
+                    time.sleep(0.5)
+                
+                # Check MP (mana) - typically blue or green bar
+                # Create explicit copy to avoid keeping reference to full screenshot
+                mp_region = screenshot[0:self.screen_height//10, self.screen_width//3:self.screen_width*2//3].copy()
+                mp_brightness = np.mean(cv2.cvtColor(mp_region, cv2.COLOR_BGR2GRAY))
+                
+                # Release intermediate image
+                del mp_region
+                
+                # If MP bar is dark (low mana), use MP potion
+                if mp_brightness < 100:
+                    logger.info("Low MP detected, using MP potion...")
+                    self._use_mp_potion()
+                    if health_status == "healthy":
+                        health_status = "low_mp"
+                    else:
+                        health_status = "low_hp_mp"
+                    time.sleep(0.5)
+                
+                return health_status
+            finally:
+                # Don't delete screenshot here - it's cached and will be reused
+                pass
                 
         except Exception as e:
             logger.debug(f"Error checking potions: {e}")
@@ -673,31 +808,35 @@ class GameAutomation:
     def _auto_attack(self):
         """Auto-attack nearby enemies"""
         try:
-            # Take screenshot to detect enemies
-            screenshot = self.adb.take_screenshot()
+            # Use cached screenshot to avoid multiple screenshots per loop
+            screenshot = self._get_cached_screenshot()
             if screenshot is None:
                 return
             
-            # Attack button is typically in bottom-center or bottom-right
-            # Common location for auto-attack button
-            attack_x = int(self.screen_width * 0.5)
-            attack_y = int(self.screen_height * 0.9)
-            
-            # Tap attack button
-            self._tap(attack_x, attack_y)
-            self.last_action = "auto_attack"
-            
-            # Update state monitor
-            if STATE_MONITOR_AVAILABLE and self.device_id:
-                device_state_monitor.update_game_state(
-                    self.device_id,
-                    action="auto_attack"
-                )
-            
-            logger.debug(f"Auto-attack executed at ({attack_x}, {attack_y})")
-            
-            # Small delay after attack
-            time.sleep(0.3)
+            try:
+                # Attack button is typically in bottom-center or bottom-right
+                # Common location for auto-attack button
+                attack_x = int(self.screen_width * 0.5)
+                attack_y = int(self.screen_height * 0.9)
+                
+                # Tap attack button
+                self._tap(attack_x, attack_y)
+                self.last_action = "auto_attack"
+                
+                # Update state monitor
+                if STATE_MONITOR_AVAILABLE and self.device_id:
+                    device_state_monitor.update_game_state(
+                        self.device_id,
+                        action="auto_attack"
+                    )
+                
+                logger.debug(f"Auto-attack executed at ({attack_x}, {attack_y})")
+                
+                # Small delay after attack
+                time.sleep(0.3)
+            finally:
+                # Don't delete screenshot here - it's cached and will be reused
+                pass
             
         except Exception as e:
             logger.debug(f"Error in auto-attack: {e}")
@@ -705,22 +844,26 @@ class GameAutomation:
     def _collect_items(self):
         """Collect items on the ground"""
         try:
-            # Take screenshot to detect items
-            screenshot = self.adb.take_screenshot()
+            # Use cached screenshot to avoid multiple screenshots per loop
+            screenshot = self._get_cached_screenshot()
             if screenshot is None:
                 return
             
-            # Look for item indicators on screen
-            # Items are typically marked with icons or text
-            # For now, we'll use a simple approach: tap center area where items might be
-            
-            # Item collection is usually done by tapping the item or using collect button
-            # Common locations: center of screen or bottom area
-            collect_x = int(self.screen_width * 0.5 + random.randint(-50, 50))
-            collect_y = int(self.screen_height * 0.6 + random.randint(-50, 50))
-            
-            self._tap(collect_x, collect_y)
-            self.last_action = "collect_items"
+            try:
+                # Look for item indicators on screen
+                # Items are typically marked with icons or text
+                # For now, we'll use a simple approach: tap center area where items might be
+                
+                # Item collection is usually done by tapping the item or using collect button
+                # Common locations: center of screen or bottom area
+                collect_x = int(self.screen_width * 0.5 + random.randint(-50, 50))
+                collect_y = int(self.screen_height * 0.6 + random.randint(-50, 50))
+                
+                self._tap(collect_x, collect_y)
+                self.last_action = "collect_items"
+            finally:
+                # Don't delete screenshot here - it's cached and will be reused
+                pass
             
             # Update state monitor
             if STATE_MONITOR_AVAILABLE and self.device_id:
@@ -742,16 +885,21 @@ class GameAutomation:
             # Check for quest completion notifications
             # Quest notifications are typically at top or side of screen
             
-            # Take screenshot
-            screenshot = self.adb.take_screenshot()
+            # Use cached screenshot to avoid multiple screenshots per loop
+            screenshot = self._get_cached_screenshot()
             if screenshot is None:
                 return
             
-            # Look for quest notification indicators
-            # This is a placeholder - implement based on your game's UI
-            
-            # For now, we'll just check periodically
-            # Quest completion is often indicated by specific UI elements
+            try:
+                # Look for quest notification indicators
+                # This is a placeholder - implement based on your game's UI
+                
+                # For now, we'll just check periodically
+                # Quest completion is often indicated by specific UI elements
+                pass  # Placeholder for future quest handling logic
+            finally:
+                # Don't delete screenshot here - it's cached and will be reused
+                pass
             
         except Exception as e:
             logger.debug(f"Error handling quests: {e}")

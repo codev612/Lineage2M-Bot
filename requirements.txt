@@ -10,5 +10,5 @@ pyyaml>=6.0
 python-dotenv>=1.0.0
 
 # Optional dependencies for advanced features
-# pytesseract>=0.3.10  # For OCR functionality
+pytesseract>=0.3.10  # For OCR functionality (replaces EasyOCR, uses ~100MB vs ~2GB)
 # mss>=7.0.1          # For faster screenshots
