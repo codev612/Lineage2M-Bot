@@ -59,7 +59,8 @@ class MainWindow(GUIEventHandlers):
         
         # Threading
         self.message_queue = queue.Queue()
-        self.screenshot_queue = queue.Queue()
+        # Limit screenshot queue to prevent memory buildup (max 3 screenshots)
+        self.screenshot_queue = queue.Queue(maxsize=3)
         
         # Create GUI
         self._setup_gui()
@@ -72,6 +73,9 @@ class MainWindow(GUIEventHandlers):
         # Start device state monitoring
         device_state_monitor.set_update_callback(self._update_device_states)
         device_state_monitor.start_monitoring(interval=2.0)
+        
+        # Update region tab device list after devices are loaded (with delay to ensure GUI is ready)
+        self.root.after(2000, self._update_region_device_list)
         
         logger.info("GUI initialized successfully")
     
@@ -120,12 +124,14 @@ class MainWindow(GUIEventHandlers):
         self.device_tab = self.tabview.add("🔌 Device Manager")
         self.bot_tab = self.tabview.add("🤖 Bot Control")
         self.monitor_tab = self.tabview.add("📊 Monitor")
+        self.region_tab = self.tabview.add("📐 Region Config")
         self.settings_tab = self.tabview.add("⚙️ Settings")
         
         # Setup each tab
         self._setup_device_tab()
         self._setup_bot_tab()
         self._setup_monitor_tab()
+        self._setup_region_tab()
         self._setup_settings_tab()
     
     def _setup_device_tab(self):
@@ -596,6 +602,996 @@ class MainWindow(GUIEventHandlers):
             width=100
         ).pack(side="left", padx=5, pady=5)
     
+    def _setup_region_tab(self):
+        """Setup the region configuration tab with canvas for drawing regions"""
+        # Main container
+        main_frame = ctk.CTkFrame(self.region_tab)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Title
+        title_label = ctk.CTkLabel(
+            main_frame,
+            text="📐 Region Configuration",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        title_label.pack(pady=10)
+        
+        # Left panel: Controls and region selection
+        left_panel = ctk.CTkFrame(main_frame)
+        left_panel.pack(side="left", fill="y", padx=(0, 5), pady=5)
+        left_panel.configure(width=250)
+        
+        # Device selection
+        device_frame = ctk.CTkFrame(left_panel)
+        device_frame.pack(fill="x", padx=10, pady=10)
+        
+        device_label = ctk.CTkLabel(device_frame, text="Device:", font=ctk.CTkFont(size=12, weight="bold"))
+        device_label.pack(pady=5)
+        
+        self.region_device_var = tk.StringVar(value="Select device...")
+        self.region_device_dropdown = ctk.CTkComboBox(
+            device_frame,
+            variable=self.region_device_var,
+            values=["Select device..."],
+            width=200,
+            state="readonly"
+        )
+        self.region_device_dropdown.pack(pady=5)
+        
+        # Screenshot button
+        screenshot_btn = ctk.CTkButton(
+            device_frame,
+            text="📸 Take Screenshot",
+            command=self._take_screenshot_for_region,
+            width=200
+        )
+        screenshot_btn.pack(pady=5)
+        
+        # Refresh device list button
+        refresh_devices_btn = ctk.CTkButton(
+            device_frame,
+            text="🔄 Refresh Device List",
+            command=self._update_region_device_list,
+            width=200
+        )
+        refresh_devices_btn.pack(pady=5)
+        
+        # Region type selection
+        region_type_frame = ctk.CTkFrame(left_panel)
+        region_type_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        region_label = ctk.CTkLabel(region_type_frame, text="Region Type:", font=ctk.CTkFont(size=12, weight="bold"))
+        region_label.pack(pady=5)
+        
+        # Scrollable frame for region types
+        self.region_type_scroll = ctk.CTkScrollableFrame(
+            region_type_frame,
+            height=200
+        )
+        self.region_type_scroll.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.region_type_var = tk.StringVar(value="player")
+        region_types = [
+            ("player", "👤 Player Region"),
+            ("quests", "📋 Quests Item Region"),
+            ("control_buttons", "🎮 Control Buttons Region"),
+            ("items", "💎 Items Region"),
+            ("health_bar", "❤️ Health Bar Region"),
+            ("mp_bar", "💙 MP Bar Region"),
+            ("other", "🔧 Other Region")
+        ]
+        
+        # Store region types for later use
+        self.region_types_list = region_types.copy()
+        
+        # Store radio button references and tick labels for updating
+        self.region_type_widgets = {}
+        
+        for region_type, label in region_types:
+            # Create a frame to hold radio button and tick mark
+            item_frame = ctk.CTkFrame(self.region_type_scroll)
+            item_frame.pack(fill="x", padx=5, pady=2)
+            
+            rb = ctk.CTkRadioButton(
+                item_frame,
+                text=label,
+                variable=self.region_type_var,
+                value=region_type,
+                command=lambda rt=region_type: self._set_region_type(rt)
+            )
+            rb.pack(side="left", padx=5)
+            
+            # Create tick label (initially empty)
+            tick_label = ctk.CTkLabel(
+                item_frame,
+                text="",
+                font=ctk.CTkFont(size=14, weight="bold"),
+                text_color="#00ff00"  # Green color
+            )
+            tick_label.pack(side="left", padx=5)
+            
+            # Store references
+            self.region_type_widgets[region_type] = {
+                'radio': rb,
+                'tick': tick_label,
+                'frame': item_frame
+            }
+        
+        # Check for saved regions and update ticks
+        self._update_region_type_ticks()
+        
+        # Load custom region types from JSON files at startup
+        self._load_custom_region_types_from_files()
+        
+        # Add custom region button
+        add_custom_btn = ctk.CTkButton(
+            region_type_frame,
+            text="➕ Add Custom Region",
+            command=self._add_custom_region_dialog,
+            width=200
+        )
+        add_custom_btn.pack(pady=5)
+        
+        # Right panel: Canvas with floating buttons
+        right_panel = ctk.CTkFrame(main_frame)
+        right_panel.pack(side="right", fill="both", expand=True, padx=(5, 0), pady=5)
+        
+        # Canvas container with relative positioning for floating buttons
+        canvas_container = ctk.CTkFrame(right_panel)
+        canvas_container.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Import RegionCanvas
+        from .region_config import RegionCanvas
+        
+        # Create canvas
+        self.region_canvas = RegionCanvas(canvas_container, width=800, height=600)
+        self.region_canvas.pack(fill="both", expand=True)
+        
+        # Store canvas container for drag bounds
+        self.canvas_container = canvas_container
+        
+        # Floating toolbar container (positioned on top of canvas) - draggable
+        # Create with transparent background
+        self.floating_toolbar = ctk.CTkFrame(
+            canvas_container, 
+            corner_radius=8,
+            fg_color="transparent",  # Transparent background
+            border_width=0  # No border
+        )
+        
+        # Initialize toolbar position immediately - use a visible default position
+        # Position will be refined after container is sized
+        self.floating_toolbar.place(x=10, y=10)  # Start at top-left so it's definitely visible
+        self.floating_toolbar.lift()  # Ensure it's on top of canvas
+        
+        # Refine position after container is ready
+        def init_toolbar_position():
+            try:
+                self.canvas_container.update_idletasks()
+                container_width = self.canvas_container.winfo_width()
+                container_height = self.canvas_container.winfo_height()
+                
+                if container_width > 0:
+                    # Get actual toolbar width
+                    self.floating_toolbar.update_idletasks()
+                    toolbar_width = self.floating_toolbar.winfo_reqwidth()
+                    
+                    # Calculate proper position (top-right with padding)
+                    initial_x = max(10, container_width - toolbar_width - 10)
+                    initial_y = 10
+                    
+                    # Ensure position is within bounds
+                    if initial_x + toolbar_width > container_width:
+                        initial_x = container_width - toolbar_width - 10
+                    if initial_x < 0:
+                        initial_x = 10
+                    
+                    self.floating_toolbar.place(x=initial_x, y=initial_y)
+                    self.floating_toolbar.lift()  # Ensure it's on top
+                    logger.debug(f"Toolbar positioned at ({initial_x}, {initial_y}), size: {toolbar_width}x{self.floating_toolbar.winfo_reqheight()}")
+            except Exception as e:
+                logger.error(f"Error initializing toolbar position: {e}", exc_info=True)
+                # Fallback: use default position
+                self.floating_toolbar.place(x=600, y=10)
+                self.floating_toolbar.lift()
+        
+        # Schedule refinement after GUI is ready (longer delay to ensure container is sized)
+        self.root.after(300, init_toolbar_position)
+        
+        # Drag state variables
+        self.toolbar_drag_start_x = 0
+        self.toolbar_drag_start_y = 0
+        self.toolbar_dragging = False
+        self.toolbar_start_x = 0
+        self.toolbar_start_y = 0
+        self.toolbar_pressed_widget = None
+        
+        # Floating toolbar buttons - icon only (create buttons BEFORE making draggable)
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "❌",
+            "",
+            self._clear_current_region
+        )
+        
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "🔄",
+            "",
+            self._clear_all_regions
+        )
+        
+        # Separator
+        separator = ctk.CTkFrame(self.floating_toolbar, width=1, height=30, fg_color=("#404040", "#404040"))
+        separator.pack(side="left", padx=5, pady=5)
+        
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "💾",
+            "",
+            self._save_regions
+        )
+        
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "📂",
+            "",
+            self._load_regions
+        )
+        
+        # Separator
+        separator2 = ctk.CTkFrame(self.floating_toolbar, width=1, height=30, fg_color=("#404040", "#404040"))
+        separator2.pack(side="left", padx=5, pady=5)
+        
+        # Zoom buttons
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "🔍+",
+            "",
+            self._zoom_in
+        )
+        
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "🔍-",
+            "",
+            self._zoom_out
+        )
+        
+        self._create_toolbar_button(
+            self.floating_toolbar,
+            "🔍",
+            "",
+            self._zoom_fit
+        )
+        
+        # Update toolbar to ensure it's visible
+        self.floating_toolbar.update_idletasks()
+        self.floating_toolbar.lift()
+        
+        # Make toolbar draggable (after buttons are created)
+        self._setup_toolbar_drag()
+        
+        # Set initial region type
+        self._set_region_type("player")
+        
+        # Update ticks and load regions when device selection changes
+        if hasattr(self, 'region_device_var'):
+            def on_device_change(*args):
+                self._load_custom_region_types_from_files()
+                self._update_region_type_ticks()
+                self._auto_load_regions()
+            self.region_device_var.trace('w', on_device_change)
+    
+    def _zoom_in(self):
+        """Zoom in the canvas"""
+        if hasattr(self, 'region_canvas'):
+            self.region_canvas.zoom_in()
+    
+    def _zoom_out(self):
+        """Zoom out the canvas"""
+        if hasattr(self, 'region_canvas'):
+            self.region_canvas.zoom_out()
+    
+    def _zoom_fit(self):
+        """Reset zoom to fit canvas"""
+        if hasattr(self, 'region_canvas'):
+            self.region_canvas.zoom_fit()
+    
+    def _setup_toolbar_drag(self):
+        """Setup drag and drop functionality for the floating toolbar"""
+        def on_toolbar_button_press(event):
+            """Start dragging"""
+            self.toolbar_dragging = False  # Start as False, only become True if mouse moves
+            # Get mouse position relative to root window
+            self.toolbar_drag_start_x = event.x_root
+            self.toolbar_drag_start_y = event.y_root
+            # Get current toolbar position relative to container
+            # Ensure we're using absolute positioning before getting coordinates
+            if self.floating_toolbar.winfo_exists():
+                # Get current position - if using relative positioning, convert to absolute
+                try:
+                    # Try to get current place info
+                    place_info = self.floating_toolbar.place_info()
+                    if 'relx' in place_info and place_info['relx']:
+                        # Convert relative to absolute
+                        self.canvas_container.update_idletasks()
+                        container_width = self.canvas_container.winfo_width()
+                        container_height = self.canvas_container.winfo_height()
+                        relx = float(place_info.get('relx', 0))
+                        rely = float(place_info.get('rely', 0))
+                        anchor = place_info.get('anchor', 'nw')
+                        x_offset = int(place_info.get('x', 0))
+                        y_offset = int(place_info.get('y', 0))
+                        
+                        # Calculate absolute position based on anchor
+                        if 'e' in anchor:
+                            self.toolbar_start_x = int(container_width * relx) + x_offset
+                        else:
+                            self.toolbar_start_x = int(container_width * relx) + x_offset
+                        
+                        if 's' in anchor:
+                            self.toolbar_start_y = int(container_height * rely) + y_offset
+                        else:
+                            self.toolbar_start_y = int(container_height * rely) + y_offset
+                        
+                        # Switch to absolute positioning immediately
+                        self.floating_toolbar.place(x=self.toolbar_start_x, y=self.toolbar_start_y)
+                    else:
+                        # Already using absolute positioning
+                        self.toolbar_start_x = self.floating_toolbar.winfo_x()
+                        self.toolbar_start_y = self.floating_toolbar.winfo_y()
+                except:
+                    # Fallback: get position directly
+                    self.toolbar_start_x = self.floating_toolbar.winfo_x()
+                    self.toolbar_start_y = self.floating_toolbar.winfo_y()
+            else:
+                self.toolbar_start_x = 0
+                self.toolbar_start_y = 0
+            
+            # Store which widget was pressed
+            self.toolbar_pressed_widget = event.widget
+            # Change cursor to move cursor (only on toolbar, not canvas)
+            self.floating_toolbar.configure(cursor="fleur")
+        
+        def on_toolbar_button_motion(event):
+            """Handle dragging"""
+            # Check if mouse moved enough to consider it a drag (threshold: 5 pixels)
+            dx = abs(event.x_root - self.toolbar_drag_start_x)
+            dy = abs(event.y_root - self.toolbar_drag_start_y)
+            
+            if dx > 5 or dy > 5:
+                if not self.toolbar_dragging:
+                    # Just started dragging - ensure cursor is set
+                    self.toolbar_dragging = True
+                    self.floating_toolbar.configure(cursor="fleur")
+            
+            if self.toolbar_dragging:
+                # Calculate movement delta
+                dx = event.x_root - self.toolbar_drag_start_x
+                dy = event.y_root - self.toolbar_drag_start_y
+                
+                # Calculate new position relative to container
+                new_x = self.toolbar_start_x + dx
+                new_y = self.toolbar_start_y + dy
+                
+                # Get container bounds (cache if possible to reduce updates)
+                container_width = self.canvas_container.winfo_width()
+                container_height = self.canvas_container.winfo_height()
+                
+                # Get toolbar size (cache if possible)
+                toolbar_width = self.floating_toolbar.winfo_reqwidth()
+                toolbar_height = self.floating_toolbar.winfo_reqheight()
+                
+                # Constrain to container bounds
+                new_x = max(0, min(new_x, container_width - toolbar_width))
+                new_y = max(0, min(new_y, container_height - toolbar_height))
+                
+                # Update position directly without place_forget to avoid blinking
+                # Ensure toolbar remains visible and on top
+                if self.floating_toolbar.winfo_exists():
+                    self.floating_toolbar.place(x=new_x, y=new_y)
+                    self.floating_toolbar.lift()  # Ensure it's on top
+        
+        def on_toolbar_button_release(event):
+            """Stop dragging"""
+            # If we were dragging, don't trigger button click
+            was_dragging = self.toolbar_dragging
+            
+            # Reset dragging state
+            self.toolbar_dragging = False
+            
+            # Restore normal cursor (only on toolbar)
+            self.floating_toolbar.configure(cursor="")
+            
+            # If we weren't dragging and released on a button, trigger its command
+            if not was_dragging and self.toolbar_pressed_widget:
+                # Check if the pressed widget is a button
+                if isinstance(self.toolbar_pressed_widget, ctk.CTkButton):
+                    # Get the button's command
+                    button_cmd = self.toolbar_pressed_widget.cget("command")
+                    if button_cmd:
+                        # Execute command after a small delay to ensure state is reset
+                        self.root.after(10, button_cmd)
+            
+            self.toolbar_pressed_widget = None
+        
+        # Bind drag events to toolbar frame
+        self.floating_toolbar.bind("<Button-1>", on_toolbar_button_press)
+        self.floating_toolbar.bind("<B1-Motion>", on_toolbar_button_motion)
+        self.floating_toolbar.bind("<ButtonRelease-1>", on_toolbar_button_release)
+        
+        # Also bind to toolbar buttons to allow dragging from anywhere
+        # But buttons will still work if clicked without dragging
+        def create_button_wrapper(btn):
+            """Create wrapper to handle button clicks and drags"""
+            def button_press_handler(event):
+                on_toolbar_button_press(event)
+            
+            def button_motion_handler(event):
+                on_toolbar_button_motion(event)
+            
+            def button_release_handler(event):
+                on_toolbar_button_release(event)
+            
+            btn.bind("<Button-1>", button_press_handler)
+            btn.bind("<B1-Motion>", button_motion_handler)
+            btn.bind("<ButtonRelease-1>", button_release_handler)
+        
+        # Bind drag handlers to all buttons (will be called after buttons are created)
+        # We'll do this after buttons are created in _create_toolbar_button
+        self._toolbar_button_wrappers = []
+    
+    def _create_toolbar_button(self, parent, icon, tooltip_text, command):
+        """Create a small icon-only button"""
+        btn = ctk.CTkButton(
+            parent,
+            text=icon,
+            command=command,
+            width=36,
+            height=36,
+            font=ctk.CTkFont(size=16),
+            corner_radius=6,
+            fg_color="transparent",  # Transparent background
+            hover_color=("#3a3a3a", "#3a3a3a"),  # Slight hover effect
+            border_width=0  # No border
+        )
+        btn.pack(side="left", padx=2, pady=5)
+        
+        # Bind drag handlers to button
+        def button_press_handler(event):
+            self.toolbar_dragging = False
+            self.toolbar_drag_start_x = event.x_root
+            self.toolbar_drag_start_y = event.y_root
+            
+            # Get current toolbar position - ensure using absolute positioning
+            if self.floating_toolbar.winfo_exists():
+                self.floating_toolbar.update_idletasks()
+                self.toolbar_start_x = self.floating_toolbar.winfo_x()
+                self.toolbar_start_y = self.floating_toolbar.winfo_y()
+                
+                # If position is 0 or invalid, try to get from place_info
+                if self.toolbar_start_x == 0 and self.toolbar_start_y == 0:
+                    try:
+                        place_info = self.floating_toolbar.place_info()
+                        if 'relx' in place_info and place_info['relx']:
+                            # Convert relative to absolute
+                            container_width = self.canvas_container.winfo_width()
+                            container_height = self.canvas_container.winfo_height()
+                            relx = float(place_info.get('relx', 0))
+                            rely = float(place_info.get('rely', 0))
+                            x_offset = int(place_info.get('x', 0))
+                            y_offset = int(place_info.get('y', 0))
+                            
+                            # Calculate absolute position
+                            self.toolbar_start_x = int(container_width * relx) + x_offset
+                            self.toolbar_start_y = int(container_height * rely) + y_offset
+                            
+                            # Switch to absolute positioning
+                            self.floating_toolbar.place(x=self.toolbar_start_x, y=self.toolbar_start_y)
+                    except:
+                        pass
+            
+            self.toolbar_pressed_widget = event.widget
+            # Change cursor to move cursor (only on toolbar)
+            self.floating_toolbar.configure(cursor="fleur")
+        
+        def button_motion_handler(event):
+            dx = abs(event.x_root - self.toolbar_drag_start_x)
+            dy = abs(event.y_root - self.toolbar_drag_start_y)
+            
+            if dx > 5 or dy > 5:
+                if not self.toolbar_dragging:
+                    # Just started dragging - ensure cursor is set
+                    self.toolbar_dragging = True
+                    self.floating_toolbar.configure(cursor="fleur")
+                    self.canvas_container.configure(cursor="fleur")
+            
+            if self.toolbar_dragging:
+                dx = event.x_root - self.toolbar_drag_start_x
+                dy = event.y_root - self.toolbar_drag_start_y
+                
+                new_x = self.toolbar_start_x + dx
+                new_y = self.toolbar_start_y + dy
+                
+                # Get container bounds without update_idletasks to reduce blinking
+                container_width = self.canvas_container.winfo_width()
+                container_height = self.canvas_container.winfo_height()
+                
+                # Get toolbar size without update_idletasks
+                toolbar_width = self.floating_toolbar.winfo_reqwidth()
+                toolbar_height = self.floating_toolbar.winfo_reqheight()
+                
+                new_x = max(0, min(new_x, container_width - toolbar_width))
+                new_y = max(0, min(new_y, container_height - toolbar_height))
+                
+                # Update position directly without place_forget to avoid blinking
+                # Ensure toolbar remains visible and on top
+                if self.floating_toolbar.winfo_exists():
+                    self.floating_toolbar.place(x=new_x, y=new_y)
+                    self.floating_toolbar.lift()  # Ensure it's on top
+        
+        def button_release_handler(event):
+            was_dragging = self.toolbar_dragging
+            self.toolbar_dragging = False
+            
+            # Restore normal cursor (only on toolbar)
+            self.floating_toolbar.configure(cursor="")
+            
+            if not was_dragging and self.toolbar_pressed_widget == btn:
+                if command:
+                    self.root.after(10, command)
+            
+            self.toolbar_pressed_widget = None
+        
+        btn.bind("<Button-1>", button_press_handler)
+        btn.bind("<B1-Motion>", button_motion_handler)
+        btn.bind("<ButtonRelease-1>", button_release_handler)
+        
+        return btn
+    
+    def _set_region_type(self, region_type: str):
+        """Set the current region type for drawing"""
+        if hasattr(self, 'region_canvas') and self.region_canvas:
+            self.region_canvas.set_region_type(region_type)
+            logger.debug(f"Region type set to: {region_type}")
+    
+    def _add_custom_region_type(self, region_type: str, label: str, color: str = "#ff00ff"):
+        """Add a custom region type to the list"""
+        if not hasattr(self, 'region_types_list'):
+            self.region_types_list = []
+        
+        # Check if region type already exists
+        existing_types = [rt[0] for rt in self.region_types_list]
+        if region_type in existing_types:
+            logger.warning(f"Region type '{region_type}' already exists")
+            return False
+        
+        # Add to list
+        self.region_types_list.append((region_type, label))
+        
+        # Add to canvas color mapping if not exists
+        if hasattr(self, 'region_canvas') and self.region_canvas:
+            if region_type not in self.region_canvas.region_colors:
+                self.region_canvas.region_colors[region_type] = color
+        
+        # Add radio button with tick to scrollable frame
+        if hasattr(self, 'region_type_scroll'):
+            # Create a frame to hold radio button and tick mark
+            item_frame = ctk.CTkFrame(self.region_type_scroll)
+            item_frame.pack(fill="x", padx=5, pady=2)
+            
+            rb = ctk.CTkRadioButton(
+                item_frame,
+                text=label,
+                variable=self.region_type_var,
+                value=region_type,
+                command=lambda rt=region_type: self._set_region_type(rt)
+            )
+            rb.pack(side="left", padx=5)
+            
+            # Create tick label (initially empty)
+            tick_label = ctk.CTkLabel(
+                item_frame,
+                text="",
+                font=ctk.CTkFont(size=14, weight="bold"),
+                text_color="#00ff00"  # Green color
+            )
+            tick_label.pack(side="left", padx=5)
+            
+            # Store references
+            if not hasattr(self, 'region_type_widgets'):
+                self.region_type_widgets = {}
+            self.region_type_widgets[region_type] = {
+                'radio': rb,
+                'tick': tick_label,
+                'frame': item_frame
+            }
+            
+            # Update ticks to check if this new type has saved regions
+            self._update_region_type_ticks()
+        
+        logger.info(f"Added custom region type: {region_type} ({label})")
+        return True
+    
+    def _add_custom_region_dialog(self):
+        """Show dialog to add a custom region type"""
+        # Create dialog window
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Custom Region Type")
+        dialog.geometry("400x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Make dialog modal
+        dialog.focus_set()
+        
+        # Region type name
+        name_label = ctk.CTkLabel(dialog, text="Region Type Name (ID):", font=ctk.CTkFont(size=12, weight="bold"))
+        name_label.pack(pady=(20, 5))
+        
+        name_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="e.g., custom_button, npc_dialog, etc.")
+        name_entry.pack(pady=5)
+        
+        # Display label
+        label_label = ctk.CTkLabel(dialog, text="Display Label:", font=ctk.CTkFont(size=12, weight="bold"))
+        label_label.pack(pady=(10, 5))
+        
+        label_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="e.g., 🎯 Custom Button Region")
+        label_entry.pack(pady=5)
+        
+        # Color picker (optional)
+        color_label = ctk.CTkLabel(dialog, text="Color (hex, optional):", font=ctk.CTkFont(size=12, weight="bold"))
+        color_label.pack(pady=(10, 5))
+        
+        color_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="#ff00ff")
+        color_entry.pack(pady=5)
+        
+        # Buttons
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=20)
+        
+        def add_region():
+            region_type = name_entry.get().strip()
+            label = label_entry.get().strip()
+            color = color_entry.get().strip() or "#ff00ff"
+            
+            if not region_type:
+                messagebox.showwarning("Invalid Input", "Region type name is required!")
+                return
+            
+            if not label:
+                label = region_type.replace('_', ' ').title()
+            
+            # Validate color format
+            if not color.startswith('#'):
+                color = '#' + color
+            if len(color) != 7:
+                messagebox.showwarning("Invalid Color", "Color must be in hex format (e.g., #ff00ff)")
+                return
+            
+            # Add the custom region
+            if self._add_custom_region_type(region_type, label, color):
+                messagebox.showinfo("Success", f"Custom region '{label}' added successfully!")
+                dialog.destroy()
+            else:
+                messagebox.showerror("Error", f"Failed to add region type '{region_type}'. It may already exist.")
+        
+        add_btn = ctk.CTkButton(button_frame, text="Add", command=add_region, width=100)
+        add_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(button_frame, text="Cancel", command=dialog.destroy, width=100)
+        cancel_btn.pack(side="left", padx=10)
+        
+        # Focus on name entry
+        name_entry.focus()
+    
+    def _take_screenshot_for_region(self):
+        """Take screenshot from selected device for region configuration"""
+        device_id = self.region_device_var.get()
+        if device_id == "Select device..." or not device_id:
+            messagebox.showwarning("No Device", "Please select a device first.")
+            return
+        
+        if device_id not in self.multi_device_manager.get_connected_devices():
+            messagebox.showwarning("Device Not Connected", f"Device {device_id} is not connected.")
+            return
+        
+        def screenshot_thread():
+            try:
+                self._update_status(f"📸 Taking screenshot from {device_id} for region configuration...")
+                
+                result = self.multi_device_manager.execute_on_device(
+                    device_id,
+                    'take_screenshot'
+                )
+                
+                if result is not None:
+                    # Update canvas on main thread
+                    self.root.after(0, lambda: self.region_canvas.load_screenshot(result))
+                    self._update_status(f"✅ Screenshot loaded for region configuration")
+                else:
+                    raise Exception("Failed to capture screenshot")
+                    
+            except Exception as e:
+                error_msg = f"Error taking screenshot: {e}"
+                logger.error(error_msg, exc_info=True)
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        threading.Thread(target=screenshot_thread, daemon=True).start()
+    
+    def _clear_current_region(self):
+        """Clear regions of the currently selected type"""
+        if hasattr(self, 'region_canvas') and self.region_canvas:
+            region_type = self.region_type_var.get()
+            self.region_canvas.clear_region(region_type)
+            self._update_status(f"Cleared {region_type} regions")
+            # Update ticks after clearing
+            self._update_region_type_ticks()
+    
+    def _clear_all_regions(self):
+        """Clear all regions"""
+        if hasattr(self, 'region_canvas') and self.region_canvas:
+            if messagebox.askyesno("Clear All Regions", "Are you sure you want to clear all regions?"):
+                self.region_canvas.clear_all_regions()
+                self._update_status("Cleared all regions")
+                # Update ticks after clearing
+                self._update_region_type_ticks()
+    
+    def _save_regions(self):
+        """Save regions to file"""
+        if not hasattr(self, 'region_canvas') or not self.region_canvas:
+            messagebox.showwarning("No Canvas", "Canvas not initialized.")
+            return
+        
+        # Get device ID if available for per-device regions
+        device_id = self.region_device_var.get() if hasattr(self, 'region_device_var') else None
+        if device_id and device_id != "Select device...":
+            # Use device-specific filename
+            default_filename = f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
+        else:
+            default_filename = "regions.json"
+        
+        # Ensure config directory exists
+        config_dir = Path("config")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Default path in config folder
+        file_path = config_dir / default_filename
+        
+        # Show confirmation dialog with save path
+        confirm_msg = f"Save regions to:\n{file_path}\n\nProceed?"
+        if messagebox.askyesno("Confirm Save", confirm_msg):
+            if self.region_canvas.save_regions(str(file_path)):
+                messagebox.showinfo("Success", f"Regions saved to {file_path}")
+                self._update_status(f"Regions saved to {file_path}")
+                # Update ticks after saving
+                self._update_region_type_ticks()
+            else:
+                messagebox.showerror("Error", "Failed to save regions")
+    
+    def _load_regions(self):
+        """Load regions from file"""
+        if not hasattr(self, 'region_canvas') or not self.region_canvas:
+            messagebox.showwarning("No Canvas", "Canvas not initialized.")
+            return
+        
+        # Ensure config directory exists
+        config_dir = Path("config")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_path = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=str(config_dir)
+        )
+        
+        if file_path:
+            if self.region_canvas.load_regions(file_path):
+                messagebox.showinfo("Success", f"Regions loaded from {file_path}")
+                self._update_status(f"Regions loaded from {file_path}")
+                # Update ticks after loading
+                self._update_region_type_ticks()
+            else:
+                messagebox.showerror("Error", "Failed to load regions")
+    
+    def _update_region_device_list(self):
+        """Update device dropdown in region tab"""
+        try:
+            if not hasattr(self, 'region_device_dropdown') or not self.region_device_dropdown:
+                return
+            
+            # Get connected devices
+            connected_devices = list(self.multi_device_manager.get_connected_devices().keys())
+            if connected_devices:
+                # Update dropdown
+                self.region_device_dropdown.configure(values=connected_devices)
+                current_value = self.region_device_var.get()
+                if not current_value or current_value == "Select device..." or current_value not in connected_devices:
+                    if connected_devices:
+                        self.region_device_var.set(connected_devices[0])
+            else:
+                # No devices connected
+                self.region_device_dropdown.configure(values=["Select device..."])
+                self.region_device_var.set("Select device...")
+        except Exception as e:
+            logger.debug(f"Error updating region device list: {e}")
+        
+        # Update ticks when device list changes
+        self._update_region_type_ticks()
+        # Auto-load regions when device is selected
+        self._auto_load_regions()
+    
+    def _load_custom_region_types_from_files(self):
+        """Load custom region types from JSON files and add them to the UI"""
+        try:
+            # Determine which JSON file to check
+            device_id = None
+            if hasattr(self, 'region_device_var'):
+                device_id = self.region_device_var.get()
+            
+            if device_id and device_id != "Select device...":
+                # Check device-specific file
+                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
+            else:
+                # Check default file
+                regions_file = Path("config/regions.json")
+            
+            # Also check default file if device-specific doesn't exist
+            if not regions_file.exists():
+                regions_file = Path("config/regions.json")
+            
+            # Load region types from JSON file
+            if regions_file.exists():
+                try:
+                    with open(regions_file, 'r', encoding='utf-8') as f:
+                        saved_regions = json.load(f)
+                    
+                    # Get existing region types
+                    existing_types = [rt[0] for rt in self.region_types_list] if hasattr(self, 'region_types_list') else []
+                    
+                    # Add missing region types from JSON
+                    for region_type in saved_regions.keys():
+                        if region_type not in existing_types:
+                            # Generate a label from the region type name
+                            label = region_type.replace('_', ' ').title()
+                            # Add emoji if it's a custom type
+                            if region_type not in ['player', 'quests', 'control_buttons', 'items', 'health_bar', 'mp_bar', 'other']:
+                                label = f"🔧 {label}"
+                            
+                            # Add to region types list
+                            self.region_types_list.append((region_type, label))
+                            
+                            # Add radio button with tick if not already in widgets
+                            if not hasattr(self, 'region_type_widgets') or region_type not in self.region_type_widgets:
+                                # Create a frame to hold radio button and tick mark
+                                item_frame = ctk.CTkFrame(self.region_type_scroll)
+                                item_frame.pack(fill="x", padx=5, pady=2)
+                                
+                                rb = ctk.CTkRadioButton(
+                                    item_frame,
+                                    text=label,
+                                    variable=self.region_type_var,
+                                    value=region_type,
+                                    command=lambda rt=region_type: self._set_region_type(rt)
+                                )
+                                rb.pack(side="left", padx=5)
+                                
+                                # Create tick label
+                                tick_label = ctk.CTkLabel(
+                                    item_frame,
+                                    text="",
+                                    font=ctk.CTkFont(size=14, weight="bold"),
+                                    text_color="#00ff00"  # Green color
+                                )
+                                tick_label.pack(side="left", padx=5)
+                                
+                                # Store references
+                                if not hasattr(self, 'region_type_widgets'):
+                                    self.region_type_widgets = {}
+                                self.region_type_widgets[region_type] = {
+                                    'radio': rb,
+                                    'tick': tick_label,
+                                    'frame': item_frame
+                                }
+                            
+                            # Add color to canvas if not exists
+                            if hasattr(self, 'region_canvas') and self.region_canvas:
+                                if region_type not in self.region_canvas.region_colors:
+                                    # Assign a default color for custom types
+                                    self.region_canvas.region_colors[region_type] = "#ff00ff"  # Magenta
+                            
+                            logger.info(f"Loaded custom region type from file: {region_type} ({label})")
+                
+                except Exception as e:
+                    logger.debug(f"Error loading custom region types from file: {e}")
+        
+        except Exception as e:
+            logger.debug(f"Error in _load_custom_region_types_from_files: {e}")
+    
+    def _auto_load_regions(self):
+        """Automatically load saved regions when device is selected"""
+        if not hasattr(self, 'region_canvas') or not self.region_canvas:
+            return
+        
+        try:
+            # Determine which JSON file to load
+            device_id = None
+            if hasattr(self, 'region_device_var'):
+                device_id = self.region_device_var.get()
+            
+            if device_id and device_id != "Select device...":
+                # Load device-specific file
+                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
+            else:
+                # Load default file
+                regions_file = Path("config/regions.json")
+            
+            # Load regions if file exists
+            if regions_file.exists():
+                if self.region_canvas.load_regions(str(regions_file)):
+                    logger.info(f"Auto-loaded regions from {regions_file}")
+                else:
+                    logger.debug(f"Failed to auto-load regions from {regions_file}")
+        
+        except Exception as e:
+            logger.debug(f"Error auto-loading regions: {e}")
+    
+    def _update_region_type_ticks(self):
+        """Update green tick marks for region types that have saved regions"""
+        if not hasattr(self, 'region_type_widgets'):
+            return
+        
+        try:
+            # Determine which JSON file to check
+            device_id = None
+            if hasattr(self, 'region_device_var'):
+                device_id = self.region_device_var.get()
+            
+            if device_id and device_id != "Select device...":
+                # Check device-specific file
+                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
+            else:
+                # Check default file
+                regions_file = Path("config/regions.json")
+            
+            # Load regions if file exists
+            saved_regions = {}
+            if regions_file.exists():
+                try:
+                    with open(regions_file, 'r', encoding='utf-8') as f:
+                        saved_regions = json.load(f)
+                except Exception as e:
+                    logger.debug(f"Error reading regions file: {e}")
+            
+            # Update tick marks for each region type
+            for region_type, widgets in self.region_type_widgets.items():
+                tick_label = widgets['tick']
+                if region_type in saved_regions and saved_regions[region_type]:
+                    # Has regions - show green tick
+                    tick_label.configure(text="✓")
+                else:
+                    # No regions - clear tick
+                    tick_label.configure(text="")
+        
+        except Exception as e:
+            logger.debug(f"Error updating region type ticks: {e}")
+    
+    def _load_config_display(self):
+        """Load and display current configuration"""
+        try:
+            import yaml
+            config_file = Path("config/bot_config.yaml")
+            if config_file.exists():
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config_text = f.read()
+                self.config_text.delete("1.0", "end")
+                self.config_text.insert("1.0", config_text)
+            else:
+                self.config_text.insert("1.0", "# Configuration file not found")
+        except Exception as e:
+            logger.error(f"Error loading config display: {e}")
+            self.config_text.insert("1.0", f"Error loading configuration: {e}")
+    
     def _setup_settings_tab(self):
         """Setup the settings tab"""
         # Configuration section
@@ -696,10 +1692,20 @@ class MainWindow(GUIEventHandlers):
                         message = self.message_queue.get_nowait()
                         self._process_message(message)
                     
-                    # Process screenshot queue
-                    while not self.screenshot_queue.empty():
-                        screenshot = self.screenshot_queue.get_nowait()
-                        self._update_screenshot_display(screenshot)
+                    # Process screenshot queue (limit to 1 at a time to prevent memory buildup)
+                    screenshot = None
+                    try:
+                        # Get only the most recent screenshot, discard old ones
+                        while not self.screenshot_queue.empty():
+                            if screenshot is not None:
+                                del screenshot  # Release old screenshot
+                            screenshot = self.screenshot_queue.get_nowait()
+                        
+                        if screenshot is not None:
+                            self._update_screenshot_display(screenshot)
+                            del screenshot  # Release after display
+                    except Exception as e:
+                        logger.debug(f"Error processing screenshot queue: {e}")
                     
                     time.sleep(0.1)
                     

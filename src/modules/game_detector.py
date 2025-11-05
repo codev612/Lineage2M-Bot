@@ -136,11 +136,16 @@ class GameDetector:
             # If "Tap screen" is detected, we're in server selection state
             if tap_screen_detected:
                 logger.info("'Tap screen' text detected - game is in server selection state")
+                # Release screenshot after processing
+                del screenshot
                 return state
             
             # Analyze screenshot for game elements
             game_elements = self._analyze_screenshot(screenshot)
             state.update(game_elements)
+            
+            # Release screenshot after processing
+            del screenshot
             
             return state
             
@@ -170,22 +175,30 @@ class GameDetector:
                 logger.debug("EasyOCR not available for 'Tap screen' detection")
                 return False
             
-            # Initialize OCR reader if not already done
-            if not hasattr(self, '_ocr_reader') or self._ocr_reader is None:
-                try:
-                    logger.debug("Initializing EasyOCR reader for 'Tap screen' detection...")
-                    self._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-                    logger.debug("EasyOCR reader initialized")
-                except Exception as e:
-                    logger.warning(f"Failed to initialize EasyOCR: {e}")
-                    return False
+            # Use shared OCR reader to avoid multiple instances
+            from ..utils.ocr_reader import shared_ocr_reader
+            ocr_reader = shared_ocr_reader.get_reader()
+            if ocr_reader is None:
+                return False
+            
+            # Downsample image for OCR to reduce memory usage (OCR doesn't need full resolution)
+            # Resize to max 1920x1080 while maintaining aspect ratio
+            height, width = screenshot.shape[:2]
+            max_dimension = 1920
+            if max(height, width) > max_dimension:
+                scale = max_dimension / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                screenshot_resized = cv2.resize(screenshot, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            else:
+                screenshot_resized = screenshot
             
             # Convert BGR to RGB for EasyOCR
-            rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
+            rgb_image = cv2.cvtColor(screenshot_resized, cv2.COLOR_BGR2RGB)
             
-            # Perform OCR on the entire screenshot
+            # Perform OCR on the resized screenshot
             # Use paragraph=False to get individual text detections
-            results = self._ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
+            results = ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
             
             # Search for "Tap screen" or variations
             tap_screen_variations = [

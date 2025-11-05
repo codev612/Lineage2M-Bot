@@ -645,7 +645,17 @@ class GUIEventHandlers:
                     if self.bot_running:
                         screenshot = self.device_manager.adb.take_screenshot()
                         if screenshot is not None:
-                            self.screenshot_queue.put(screenshot)
+                            # Remove old screenshots if queue is full
+                            try:
+                                self.screenshot_queue.put_nowait(screenshot)
+                            except queue.Full:
+                                # Remove oldest screenshot and add new one
+                                try:
+                                    old_screenshot = self.screenshot_queue.get_nowait()
+                                    del old_screenshot  # Explicitly delete old screenshot
+                                    self.screenshot_queue.put_nowait(screenshot)
+                                except queue.Empty:
+                                    pass
                     
                     # Wait for configured interval
                     time.sleep(self.interval_var.get())
@@ -682,7 +692,21 @@ class GUIEventHandlers:
                 
                 screenshot = self.device_manager.adb.take_screenshot()
                 if screenshot is not None:
-                    self.screenshot_queue.put(screenshot)
+                    # Release old screenshot if exists
+                    if hasattr(self, 'current_screenshot') and self.current_screenshot is not None:
+                        del self.current_screenshot
+                    
+                    # Add to queue (remove oldest if full)
+                    try:
+                        self.screenshot_queue.put_nowait(screenshot)
+                    except queue.Full:
+                        try:
+                            old_screenshot = self.screenshot_queue.get_nowait()
+                            del old_screenshot
+                            self.screenshot_queue.put_nowait(screenshot)
+                        except queue.Empty:
+                            pass
+                    
                     self.current_screenshot = screenshot
                     
                     self.message_queue.put({
@@ -2111,6 +2135,10 @@ For support and documentation, visit the project repository."""
             
             self._update_device_list(devices)
             
+            # Update region tab device list
+            if hasattr(self, '_update_region_device_list'):
+                self.root.after(0, self._update_region_device_list)
+            
             # Auto-select the newly added device
             connected_devices = self.multi_device_manager.get_connected_devices()
             self._auto_select_connected_devices(connected_devices)
@@ -2137,6 +2165,9 @@ For support and documentation, visit the project repository."""
             self._refresh_device_control_widgets()
             
         elif msg_type == 'devices_restored':
+            # Update region tab device list
+            if hasattr(self, '_update_region_device_list'):
+                self.root.after(0, self._update_region_device_list)
             devices = message['devices']
             restored_count = message.get('restored_count', 0)
             device_status = message.get('device_status', {})

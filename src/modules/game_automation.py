@@ -5,6 +5,7 @@ Handles game actions, state detection, and automated gameplay strategies
 
 import time
 import random
+import gc
 from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
@@ -235,6 +236,10 @@ class GameAutomation:
             game_state = self.game_detector.detect_game_state()
             self.current_state = game_state.get('status', 'unknown')
             
+            # Release screenshot from game_state if it exists (to free memory)
+            if 'screenshot' in game_state:
+                del game_state['screenshot']
+            
             # Execute appropriate actions based on game state
             if self.current_state == 'in_game':
                 # Success - reset any retry counters and reset entered flag
@@ -262,6 +267,13 @@ class GameAutomation:
             else:
                 logger.debug(f"Unknown game state: {self.current_state}, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
                 time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+            
+            # Periodic garbage collection to free memory (every 10 loops)
+            if not hasattr(self, '_loop_count'):
+                self._loop_count = 0
+            self._loop_count += 1
+            if self._loop_count % 10 == 0:
+                gc.collect()
                 
         except Exception as e:
             step_name = "game_loop_error"
@@ -498,20 +510,28 @@ class GameAutomation:
                 logger.debug("EasyOCR not available for position detection")
                 return None
             
-            # Use game detector's OCR reader if available
-            if not hasattr(self.game_detector, '_ocr_reader') or self.game_detector._ocr_reader is None:
-                try:
-                    import easyocr
-                    self.game_detector._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-                except Exception as e:
-                    logger.debug(f"Failed to initialize OCR reader: {e}")
-                    return None
+            # Use shared OCR reader to avoid multiple instances
+            from ..utils.ocr_reader import shared_ocr_reader
+            ocr_reader = shared_ocr_reader.get_reader()
+            if ocr_reader is None:
+                return None
+            
+            # Downsample image for OCR to reduce memory usage
+            height, width = screenshot.shape[:2]
+            max_dimension = 1920
+            if max(height, width) > max_dimension:
+                scale = max_dimension / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                screenshot_resized = cv2.resize(screenshot, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            else:
+                screenshot_resized = screenshot
             
             # Convert BGR to RGB for EasyOCR
-            rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
+            rgb_image = cv2.cvtColor(screenshot_resized, cv2.COLOR_BGR2RGB)
             
-            # Perform OCR
-            results = self.game_detector._ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
+            # Perform OCR on the resized screenshot
+            results = ocr_reader.readtext(rgb_image, detail=1, paragraph=False)
             
             # Search for "Tap screen" variations
             tap_screen_variations = [

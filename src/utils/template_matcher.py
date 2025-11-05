@@ -380,20 +380,13 @@ class TemplateMatcher:
         return sorted(templates)
     
     def _get_ocr_reader(self):
-        """Get or initialize EasyOCR reader (lazy initialization)"""
+        """Get shared EasyOCR reader (to avoid multiple instances)"""
         if not EASYOCR_AVAILABLE:
             return None
         
-        if self._ocr_reader is None:
-            try:
-                logger.info("Initializing EasyOCR reader...")
-                self._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-                logger.info("EasyOCR reader initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize EasyOCR: {e}")
-                return None
-        
-        return self._ocr_reader
+        # Use shared OCR reader singleton instead of creating new instance
+        from ..utils.ocr_reader import shared_ocr_reader
+        return shared_ocr_reader.get_reader()
     
     def find_template_and_extract_text(self,
                                       screenshot: np.ndarray,
