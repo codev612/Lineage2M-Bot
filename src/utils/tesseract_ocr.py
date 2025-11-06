@@ -11,6 +11,61 @@ import platform
 
 from ..utils.logger import get_logger
 
+def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
+    """Convert BGR image to grayscale - fallback if cv2.cvtColor doesn't exist"""
+    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGR2GRAY'):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        # Manual BGR to grayscale conversion using standard formula
+        # gray = 0.114*B + 0.587*G + 0.299*R
+        if len(image.shape) == 3:
+            b, g, r = image[:, :, 0], image[:, :, 1], image[:, :, 2]
+            gray = (0.114 * b.astype(np.float32) + 
+                    0.587 * g.astype(np.float32) + 
+                    0.299 * r.astype(np.float32)).astype(np.uint8)
+            return gray
+        else:
+            return image
+
+def _threshold_otsu(gray: np.ndarray) -> np.ndarray:
+    """Apply OTSU thresholding - fallback if cv2.threshold doesn't exist"""
+    if hasattr(cv2, 'threshold') and hasattr(cv2, 'THRESH_BINARY') and hasattr(cv2, 'THRESH_OTSU'):
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresh
+    else:
+        # Manual OTSU thresholding
+        # Calculate histogram
+        hist, bins = np.histogram(gray.flatten(), 256, [0, 256])
+        hist = hist.astype(np.float32)
+        
+        # Calculate cumulative sums
+        cumsum = np.cumsum(hist)
+        cumsum_w = np.cumsum(hist * np.arange(256))
+        
+        # Calculate between-class variance for all thresholds
+        total_mean = cumsum_w[-1] / cumsum[-1]
+        between_class_var = np.zeros(256)
+        
+        for t in range(256):
+            w0 = cumsum[t]
+            if w0 == 0:
+                continue
+            w1 = cumsum[-1] - w0
+            if w1 == 0:
+                break
+            
+            mean0 = cumsum_w[t] / w0
+            mean1 = (cumsum_w[-1] - cumsum_w[t]) / w1
+            
+            between_class_var[t] = w0 * w1 * (mean0 - mean1) ** 2
+        
+        # Find threshold with maximum variance
+        threshold = np.argmax(between_class_var)
+        
+        # Apply threshold
+        thresh = np.where(gray > threshold, 255, 0).astype(np.uint8)
+        return thresh
+
 logger = get_logger(__name__)
 
 # Try to import pytesseract
@@ -158,13 +213,13 @@ class TesseractOCRReader:
         try:
             # Convert to grayscale if needed
             if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                gray = _bgr_to_gray(image)
             else:
                 gray = image.copy()
             
             # Preprocess image for better OCR results
             # Apply thresholding (OTSU)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresh = _threshold_otsu(gray)
             
             if detail == 0:
                 # Simple text extraction
@@ -237,11 +292,11 @@ class TesseractOCRReader:
                 return None
             
             # Convert to grayscale
-            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+            gray = _bgr_to_gray(cropped)
             
             if preprocess:
                 # Apply thresholding (like the sample code)
-                _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                thresh = _threshold_otsu(gray)
             else:
                 thresh = gray
             

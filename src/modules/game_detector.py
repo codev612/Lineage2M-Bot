@@ -7,12 +7,194 @@ from typing import Tuple, Optional, Dict, List
 import re
 import cv2
 import numpy as np
+import json
+from pathlib import Path
 
 from ..utils.logger import get_logger
 from ..utils.config import GameConfig
 from ..utils.exceptions import GameStateError
+from ..utils.template_matcher import TemplateMatcher
 
 logger = get_logger(__name__)
+
+# Helper functions for color conversions with OpenCV fallbacks
+def _bgr_to_gray(image: np.ndarray) -> np.ndarray:
+    """Convert BGR image to grayscale - fallback if cv2.cvtColor doesn't exist"""
+    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGR2GRAY'):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        # Manual BGR to grayscale conversion using standard formula
+        # gray = 0.114*B + 0.587*G + 0.299*R
+        if len(image.shape) == 3:
+            b, g, r = image[:, :, 0], image[:, :, 1], image[:, :, 2]
+            gray = (0.114 * b.astype(np.float32) + 
+                    0.587 * g.astype(np.float32) + 
+                    0.299 * r.astype(np.float32)).astype(np.uint8)
+            return gray
+        else:
+            return image
+
+def _bgr_to_hsv(image: np.ndarray) -> np.ndarray:
+    """Convert BGR image to HSV - fallback if cv2.cvtColor doesn't exist"""
+    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGR2HSV'):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    else:
+        # Manual BGR to HSV conversion
+        # This is a simplified version - for full accuracy, OpenCV's implementation is preferred
+        if len(image.shape) != 3:
+            raise ValueError("BGR to HSV conversion requires 3-channel image")
+        
+        bgr = image.astype(np.float32) / 255.0
+        b, g, r = bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2]
+        
+        # Calculate V (Value/Brightness)
+        v = np.maximum(np.maximum(b, g), r)
+        
+        # Calculate S (Saturation)
+        min_val = np.minimum(np.minimum(b, g), r)
+        delta = v - min_val
+        s = np.where(v == 0, 0, delta / (v + 1e-10))
+        
+        # Calculate H (Hue)
+        h = np.zeros_like(v)
+        
+        # Red channel is max
+        mask_r = (v == r) & (delta != 0)
+        h[mask_r] = 60 * (((g[mask_r] - b[mask_r]) / (delta[mask_r] + 1e-10)) % 6)
+        
+        # Green channel is max
+        mask_g = (v == g) & (delta != 0)
+        h[mask_g] = 60 * (((b[mask_g] - r[mask_g]) / (delta[mask_g] + 1e-10)) + 2)
+        
+        # Blue channel is max
+        mask_b = (v == b) & (delta != 0)
+        h[mask_b] = 60 * (((r[mask_b] - g[mask_b]) / (delta[mask_b] + 1e-10)) + 4)
+        
+        # Normalize to OpenCV range: H[0-179], S[0-255], V[0-255]
+        h = (h / 2).astype(np.uint8)  # H: 0-180 -> 0-179
+        s = (s * 255).astype(np.uint8)  # S: 0-1 -> 0-255
+        v = (v * 255).astype(np.uint8)  # V: 0-1 -> 0-255
+        
+        hsv = np.stack([h, s, v], axis=2)
+        return hsv
+
+def _resize_image(image: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """Resize image - fallback if cv2.resize doesn't exist"""
+    if hasattr(cv2, 'resize'):
+        return cv2.resize(image, size)
+    else:
+        # Fallback: Use PIL to resize
+        from PIL import Image
+        # Convert numpy array to PIL Image
+        if len(image.shape) == 3:
+            # BGR to RGB for PIL
+            pil_image = Image.fromarray(image[:, :, ::-1])
+        else:
+            # Grayscale
+            pil_image = Image.fromarray(image)
+        
+        # Resize using PIL
+        resized_pil = pil_image.resize(size, Image.LANCZOS)
+        
+        # Convert back to numpy array
+        resized = np.array(resized_pil)
+        
+        # Convert RGB back to BGR if needed
+        if len(resized.shape) == 3:
+            resized = resized[:, :, ::-1]
+        
+        return resized
+
+def _canny_edge_detection(image: np.ndarray, threshold1: float = 50, threshold2: float = 150) -> np.ndarray:
+    """Canny edge detection - fallback if cv2.Canny doesn't exist"""
+    if hasattr(cv2, 'Canny'):
+        return cv2.Canny(image, int(threshold1), int(threshold2))
+    else:
+        # Fallback: Simplified edge detection using Sobel operator
+        # This is a basic implementation - for full Canny accuracy, OpenCV is preferred
+        if len(image.shape) == 3:
+            # Convert to grayscale if needed
+            gray = _bgr_to_gray(image)
+        else:
+            gray = image
+        
+        # Apply Gaussian blur (simplified - using basic smoothing)
+        # In a real Canny implementation, this would be a proper Gaussian kernel
+        blurred = None
+        try:
+            from scipy import ndimage
+            blurred = ndimage.gaussian_filter(gray.astype(np.float32), sigma=1.0).astype(np.uint8)
+        except (ImportError, AttributeError, RuntimeError, OSError, Exception) as e:
+            # If scipy is not available or broken, use simple box filter
+            # Catch all exceptions since scipy might be installed but broken
+            pass
+        
+        if blurred is None:
+            # Use simple box filter (average blur) as fallback
+            # This is a basic 3x3 averaging kernel using vectorized operations
+            gray_float = gray.astype(np.float32)
+            h, w = gray.shape
+            
+            # Pad image with edge values for proper convolution
+            padded = np.pad(gray_float, ((1, 1), (1, 1)), mode='edge')
+            
+            # Apply 3x3 box filter using vectorized operations
+            # Sum over 3x3 neighborhoods
+            blurred = np.zeros_like(gray_float)
+            for i in range(h):
+                for j in range(w):
+                    blurred[i, j] = np.mean(padded[i:i+3, j:j+3])
+            
+            blurred = blurred.astype(np.uint8)
+        
+        # Sobel operators for gradient detection
+        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+        
+        # Calculate gradients using vectorized operations
+        blurred_float = blurred.astype(np.float32)
+        h, w = blurred.shape
+        
+        # Pad image for convolution
+        padded = np.pad(blurred_float, ((1, 1), (1, 1)), mode='edge')
+        
+        # Calculate gradients using convolution
+        gx = np.zeros_like(blurred_float)
+        gy = np.zeros_like(blurred_float)
+        
+        for i in range(1, h + 1):
+            for j in range(1, w + 1):
+                region = padded[i-1:i+2, j-1:j+2]
+                gx[i-1, j-1] = np.sum(region * sobel_x)
+                gy[i-1, j-1] = np.sum(region * sobel_y)
+        
+        # Calculate gradient magnitude
+        magnitude = np.sqrt(gx**2 + gy**2)
+        
+        # Apply double threshold (simplified version)
+        edges = np.zeros_like(magnitude, dtype=np.uint8)
+        strong_edges = magnitude > threshold2
+        weak_edges = (magnitude > threshold1) & (magnitude <= threshold2)
+        
+        edges[strong_edges] = 255
+        
+        # Hysteresis: connect weak edges to strong edges (simplified)
+        # Use convolution to find weak edges adjacent to strong edges
+        if np.any(weak_edges):
+            # Create a kernel to check 8-neighborhood
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            kernel[1, 1] = 0  # Don't count center pixel
+            # Convolve strong edges to find neighbors
+            strong_padded = np.pad(strong_edges.astype(np.uint8), 1, mode='constant')
+            neighbors = np.zeros_like(weak_edges)
+            for i in range(1, h + 1):
+                for j in range(1, w + 1):
+                    neighbors[i-1, j-1] = np.sum(strong_padded[i-1:i+2, j-1:j+2] * kernel) > 0
+            
+            # Connect weak edges that have strong edge neighbors
+            edges[weak_edges & neighbors] = 255
+        
+        return edges
 
 class GameDetector:
     """
@@ -38,6 +220,25 @@ class GameDetector:
             'com.ncsoft.lineage2m.sea',
             'com.ncsoft.lineage2m.kr'
         ]
+        
+        # Template matcher for image detection
+        self.template_matcher = TemplateMatcher()
+        
+        # Region configurations (loaded from JSON)
+        self.regions = {}
+        self.device_id = None  # Will be set when device is connected
+        
+        # Game state detection patterns
+        self.state_text_patterns = {
+            'in_game': ['character', 'level', 'exp', 'hp', 'mp', 'attack', 'defense'],
+            'main_menu': ['start', 'character', 'settings', 'exit', 'menu'],
+            'loading_screen': ['loading', 'please wait', 'connecting'],
+            'character_select': ['select character', 'create character', 'character'],
+            'inventory': ['inventory', 'items', 'equipment'],
+            'quest': ['quest', 'mission', 'objective'],
+            'shop': ['shop', 'buy', 'sell', 'npc'],
+            'dialogue': ['next', 'continue', 'skip', 'close']
+        }
     
     def is_lineage2m_running(self) -> Tuple[bool, Optional[str]]:
         """
@@ -104,9 +305,13 @@ class GameDetector:
             logger.error(f"Error checking if Lineage 2M is running: {e}", exc_info=True)
             return False, None
     
-    def detect_game_state(self) -> Dict:
+    def detect_game_state(self, skip_tap_screen_check: bool = False, previous_state: str = None) -> Dict:
         """
-        Detect current game state using screenshot analysis
+        Detect current game state using screenshot analysis, image matching, and OCR
+        
+        Args:
+            skip_tap_screen_check: If True, skip tap screen detection (for when already in-game)
+            previous_state: Previous game state - if in-game, skip tap screen detection
         
         Returns:
             Dictionary containing game state information
@@ -124,8 +329,16 @@ class GameDetector:
             # Store screen size before processing (screenshot will be deleted)
             screen_size = screenshot.shape[:2]
             
-            # Check for "Tap screen" text first (common game startup state)
-            tap_screen_detected = self._detect_tap_screen_text(screenshot)
+            # Never check for "Tap screen" if we're already in-game or if explicitly skipped
+            # Check previous state first - if in-game, skip tap screen detection
+            is_in_game_state = previous_state in ['in_game', 'in_game_with_ui']
+            skip_check = skip_tap_screen_check or is_in_game_state
+            
+            tap_screen_detected = False
+            if not skip_check:
+                tap_screen_detected = self._detect_tap_screen_text(screenshot)
+            else:
+                logger.debug("Skipping tap screen detection (already in-game or explicitly skipped)")
             
             # Basic game state detection
             state = {
@@ -142,9 +355,15 @@ class GameDetector:
                 logger.info("'Tap screen' text detected - game is in server selection state")
                 return state
             
-            # Analyze screenshot for game elements
-            game_elements = self._analyze_screenshot(screenshot)
-            state.update(game_elements)
+            # Enhanced state detection using images and text
+            detected_state = self._detect_game_state_enhanced(screenshot)
+            if detected_state:
+                state['status'] = detected_state
+                logger.info(f"Detected game state: {detected_state}")
+            else:
+                # Fallback to basic analysis
+                game_elements = self._analyze_screenshot(screenshot)
+                state.update(game_elements)
             
             return state
         except Exception as e:
@@ -230,6 +449,1392 @@ class GameDetector:
             logger.debug(f"Error detecting 'Tap screen' text: {e}")
             return False
     
+    def _detect_select_character_text(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect "Select Character" text on screenshot using Tesseract OCR
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if "Select Character" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                logger.debug("Tesseract OCR not available for 'Select Character' detection")
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on full resolution screenshot
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                
+                # Search for "Select Character" or variations
+                select_character_variations = [
+                    'select character',
+                    'select a character',
+                    'character select',
+                    'choose character',
+                    'character',
+                    'select'
+                ]
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if any variation matches
+                    for variation in select_character_variations:
+                        if variation in text_lower:
+                            logger.info(f"Detected 'Select Character' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    logger.debug("'Select Character' text not detected in screenshot")
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting 'Select Character' text: {e}")
+            return False
+    
+    def detect_select_character_and_enter_button(self, screenshot: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        """
+        Detect both "Select Character" text AND enter button in screenshot
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            Tuple of (both_detected, enter_button_position)
+            - both_detected: True if both "Select Character" text and enter button are detected
+            - enter_button_position: (x, y) position of enter button if found, None otherwise
+        """
+        try:
+            # Check for "Select Character" text
+            select_character_detected = self._detect_select_character_text(screenshot)
+            
+            # Check for enter button using template matching
+            enter_button_position = None
+            try:
+                enter_result = self.template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
+                if enter_result:
+                    x, y, confidence = enter_result
+                    enter_button_position = (x, y)
+                    logger.info(f"Enter button detected at ({x}, {y}) with confidence {confidence:.3f}")
+            except Exception as e:
+                logger.debug(f"Error detecting enter button: {e}")
+            
+            # Both must be detected
+            both_detected = select_character_detected and (enter_button_position is not None)
+            
+            if both_detected:
+                logger.info("Both 'Select Character' text and enter button detected - game is in character selection state")
+            else:
+                if not select_character_detected:
+                    logger.debug("'Select Character' text not detected")
+                if enter_button_position is None:
+                    logger.debug("Enter button not detected")
+            
+            return both_detected, enter_button_position
+            
+        except Exception as e:
+            logger.debug(f"Error detecting select character and enter button: {e}")
+            return False, None
+    
+    def _detect_select_server_button(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect "Select Server" button using template matching
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if "Select Server" button is detected, False otherwise
+        """
+        try:
+            # Use the actual template file name from assets/templates
+            result = self.template_matcher.find_template(screenshot, "select_server_button.png", multi_scale=True, confidence=0.7)
+            if result:
+                x, y, confidence = result
+                logger.info(f"Select Server button detected at ({x}, {y}) with confidence {confidence:.3f}")
+                return True
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Error detecting Select Server button: {e}")
+            return False
+    
+    def _detect_fight_button(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect "Short" button using template matching within the short_button_region
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if "Short" button is detected, False otherwise
+        """
+        try:
+            # Ensure regions are loaded
+            if not self.regions and self.adb and self.adb.device_id:
+                self._load_regions(self.adb.device_id)
+            
+            # Get short_button_region
+            short_button_region = self._get_region('short_button_region')
+            if not short_button_region:
+                logger.warning("short_button_region not configured - searching full screenshot (this may be slower and less accurate)")
+                # Fallback to full screenshot if region not configured
+                result = self.template_matcher.find_template(screenshot, "short_button.png", multi_scale=True, confidence=0.7)
+            else:
+                x1, y1, x2, y2 = short_button_region
+                logger.debug(f"Using short_button_region: ({x1}, {y1}, {x2}, {y2})")
+                
+                # Ensure coordinates are within screenshot bounds
+                x1 = max(0, min(x1, screenshot.shape[1]))
+                y1 = max(0, min(y1, screenshot.shape[0]))
+                x2 = max(0, min(x2, screenshot.shape[1]))
+                y2 = max(0, min(y2, screenshot.shape[0]))
+                
+                if x2 <= x1 or y2 <= y1:
+                    logger.warning(f"Invalid short_button_region coordinates: ({x1}, {y1}, {x2}, {y2})")
+                    return False
+                
+                # Convert region to (x, y, width, height) format for template matcher
+                region_width = x2 - x1
+                region_height = y2 - y1
+                search_region = (x1, y1, region_width, region_height)
+                logger.debug(f"Searching for short_button.png in region: ({x1}, {y1}, {region_width}, {region_height})")
+                
+                # Search for short_button.png within the region
+                result = self.template_matcher.find_template(
+                    screenshot,
+                    "short_button.png",
+                    multi_scale=True,
+                    confidence=0.7,
+                    region=search_region
+                )
+            
+            if result:
+                x, y, confidence = result
+                logger.info(f"Short button detected at ({x}, {y}) with confidence {confidence:.3f}")
+                return True
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Error detecting Short button: {e}")
+            return False
+    
+    def _detect_character_text(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect "Character" text on screenshot using Tesseract OCR
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if "Character" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                logger.debug("Tesseract OCR not available for 'Character' text detection")
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on full resolution screenshot
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                
+                # Search for "Character" text (case-insensitive)
+                character_keywords = ['character', 'characters']
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if "character" is in the text
+                    for keyword in character_keywords:
+                        if keyword in text_lower:
+                            logger.info(f"Detected 'Character' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    logger.debug("'Character' text not detected in screenshot")
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting 'Character' text: {e}")
+            return False
+    
+    def _detect_enter_button(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect enter_button.png template in screenshot
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            True if enter_button.png is detected, False otherwise
+        """
+        try:
+            enter_result = self.template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
+            if enter_result:
+                x, y, confidence = enter_result
+                logger.info(f"Detected enter_button.png at ({x}, {y}) with confidence {confidence:.3f}")
+                return True
+            else:
+                logger.debug("enter_button.png not detected in screenshot")
+                return False
+        except Exception as e:
+            logger.debug(f"Error detecting enter button: {e}")
+            return False
+    
+    # Debug versions of detection methods that return detailed information
+    def _detect_tap_screen_text_debug(self, screenshot: np.ndarray) -> dict:
+        """Debug version that returns detailed detection info"""
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return {'detected': False, 'detections': []}
+            
+            results = None
+            detections = []
+            try:
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                tap_variations = ['tap screen', 'tap to screen', 'tap the screen', 'tap screen to', 'tap', 'tap to start', 'tap to begin']
+                
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    for variation in tap_variations:
+                        if variation in text_lower:
+                            x1, y1 = bbox[0]
+                            x2, y2 = bbox[2]
+                            detections.append({
+                                'text': text,
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': float(confidence)
+                            })
+                            break
+                return {'detected': len(detections) > 0, 'detections': detections}
+            finally:
+                if results is not None:
+                    del results
+        except Exception as e:
+            logger.debug(f"Error in debug tap detection: {e}")
+            return {'detected': False, 'detections': []}
+    
+    def _detect_character_text_debug(self, screenshot: np.ndarray) -> dict:
+        """Debug version that returns detailed detection info"""
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return {'detected': False, 'detections': []}
+            
+            results = None
+            detections = []
+            try:
+                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+                character_keywords = ['character', 'characters']
+                
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    for keyword in character_keywords:
+                        if keyword in text_lower:
+                            x1, y1 = bbox[0]
+                            x2, y2 = bbox[2]
+                            detections.append({
+                                'text': text,
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': float(confidence)
+                            })
+                            break
+                return {'detected': len(detections) > 0, 'detections': detections}
+            finally:
+                if results is not None:
+                    del results
+        except Exception as e:
+            logger.debug(f"Error in debug character detection: {e}")
+            return {'detected': False, 'detections': []}
+    
+    def _detect_select_server_button_debug(self, screenshot: np.ndarray) -> dict:
+        """Debug version that returns detailed detection info, including best match even if below threshold"""
+        try:
+            # First try with normal threshold
+            result = self.template_matcher.find_template(screenshot, "select_server_button.png", multi_scale=True)
+            if result:
+                x, y, confidence = result
+                template = self.template_matcher.load_template("select_server_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                return {'detected': True, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size}
+            
+            # If not found, try with lower threshold to find best match
+            logger.info("Template not found with normal threshold, trying lower threshold for debugging...")
+            best_match = self.template_matcher.find_template_best_match(screenshot, "select_server_button.png", multi_scale=True)
+            if best_match:
+                x, y, confidence = best_match
+                template = self.template_matcher.load_template("select_server_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                logger.warning(f"Best match found (below threshold): position=({x}, {y}), confidence={confidence:.3f}")
+                return {'detected': False, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size, 'below_threshold': True}
+            
+            return {'detected': False, 'position': None}
+        except Exception as e:
+            logger.debug(f"Error in debug select server button detection: {e}")
+            return {'detected': False, 'position': None}
+    
+    def _detect_enter_button_debug(self, screenshot: np.ndarray) -> dict:
+        """Debug version that returns detailed detection info, including best match even if below threshold"""
+        try:
+            result = self.template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
+            if result:
+                x, y, confidence = result
+                template = self.template_matcher.load_template("enter_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                return {'detected': True, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size}
+            
+            # Try with lower threshold
+            logger.info("Enter button not found with normal threshold, trying lower threshold for debugging...")
+            best_match = self.template_matcher.find_template_best_match(screenshot, "enter_button.png", multi_scale=True)
+            if best_match:
+                x, y, confidence = best_match
+                template = self.template_matcher.load_template("enter_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                logger.warning(f"Best match found (below threshold): position=({x}, {y}), confidence={confidence:.3f}")
+                return {'detected': False, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size, 'below_threshold': True}
+            
+            return {'detected': False, 'position': None}
+        except Exception as e:
+            logger.debug(f"Error in debug enter button detection: {e}")
+            return {'detected': False, 'position': None}
+    
+    def _detect_fight_button_debug(self, screenshot: np.ndarray) -> dict:
+        """Debug version that returns detailed detection info, including best match even if below threshold"""
+        try:
+            # Ensure regions are loaded
+            if not self.regions and self.adb and self.adb.device_id:
+                self._load_regions(self.adb.device_id)
+            
+            # Get short_button_region
+            short_button_region = self._get_region('short_button_region')
+            search_region = None
+            
+            if not short_button_region:
+                logger.warning("short_button_region not configured - searching full screenshot (this may be slower and less accurate)")
+            else:
+                x1, y1, x2, y2 = short_button_region
+                logger.debug(f"Using short_button_region: ({x1}, {y1}, {x2}, {y2})")
+                
+                # Ensure coordinates are within screenshot bounds
+                x1 = max(0, min(x1, screenshot.shape[1]))
+                y1 = max(0, min(y1, screenshot.shape[0]))
+                x2 = max(0, min(x2, screenshot.shape[1]))
+                y2 = max(0, min(y2, screenshot.shape[0]))
+                
+                if x2 > x1 and y2 > y1:
+                    # Convert region to (x, y, width, height) format for template matcher
+                    region_width = x2 - x1
+                    region_height = y2 - y1
+                    search_region = (x1, y1, region_width, region_height)
+                    logger.debug(f"Searching for short_button.png in region: ({x1}, {y1}, {region_width}, {region_height})")
+                else:
+                    logger.warning(f"Invalid short_button_region coordinates: ({x1}, {y1}, {x2}, {y2})")
+            
+            # Search for short_button.png within the region (or full screenshot if region not configured)
+            result = self.template_matcher.find_template(
+                screenshot, 
+                "short_button.png", 
+                multi_scale=True, 
+                confidence=0.7,
+                region=search_region
+            )
+            
+            if result:
+                x, y, confidence = result
+                template = self.template_matcher.load_template("short_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                logger.info(f"Short button detected in {'region' if search_region else 'full screenshot'} at ({x}, {y}) with confidence {confidence:.3f}")
+                return {'detected': True, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size}
+            
+            # Try with lower threshold
+            logger.info("Short button not found with normal threshold, trying lower threshold for debugging...")
+            best_match = self.template_matcher.find_template_best_match(
+                screenshot, 
+                "short_button.png", 
+                multi_scale=True,
+                region=search_region
+            )
+            if best_match:
+                x, y, confidence = best_match
+                template = self.template_matcher.load_template("short_button.png")
+                size = (template.shape[1], template.shape[0]) if template is not None else (100, 100)
+                logger.warning(f"Best match found (below threshold): position=({x}, {y}), confidence={confidence:.3f} in {'region' if search_region else 'full screenshot'}")
+                return {'detected': False, 'position': (int(x), int(y)), 'confidence': float(confidence), 'size': size, 'below_threshold': True}
+            
+            return {'detected': False, 'position': None}
+        except Exception as e:
+            logger.debug(f"Error in debug short button detection: {e}")
+            return {'detected': False, 'position': None}
+    
+    def _save_template_images(self, template_names: list):
+        """Save template images to debug folder for reference"""
+        try:
+            import datetime
+            import shutil
+            debug_dir = Path('debug_screenshots')
+            debug_dir.mkdir(exist_ok=True)
+            
+            templates_dir = self.template_matcher.templates_dir
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            
+            for template_name in template_names:
+                template_path = templates_dir / template_name
+                if template_path.exists():
+                    debug_template_path = debug_dir / f"template_{timestamp}_{template_name}"
+                    shutil.copy2(template_path, debug_template_path)
+                    logger.info(f"Debug template saved: {debug_template_path}")
+        except Exception as e:
+            logger.debug(f"Error saving template images: {e}")
+    
+    def detect_game_state_from_screenshot(self, screenshot: np.ndarray, debug: bool = False) -> str:
+        """
+        Detect game state from screenshot based on specific element combinations
+        
+        Basic main loop rules:
+        1. If screenshot includes "tap" text AND select_server_button.png → "select_server"
+        2. If screenshot includes "Character" text AND enter_button.png → "select_character"
+        3. If screenshot includes short_button.png → "playing"
+        4. Otherwise → "unknown"
+        
+        Args:
+            screenshot: OpenCV image array
+            debug: If True, save screenshot and detailed detection results
+            
+        Returns:
+            Game state string: 'select_server', 'select_character', 'playing', or 'unknown'
+        """
+        try:
+            logger.info("Starting game state detection from screenshot...")
+            
+            # Collect annotation data for debug images
+            annotations = {'templates': [], 'text': []}
+            
+            # Save screenshot for debugging if requested
+            if debug:
+                self._save_debug_screenshot(screenshot, "detection_start")
+            
+            # Rule 1: Check for "tap" text AND select_server_button.png
+            logger.info("Rule 1: Checking for 'tap' text and select_server_button.png...")
+            tap_result = self._detect_tap_screen_text_debug(screenshot) if debug else self._detect_tap_screen_text(screenshot)
+            if debug and isinstance(tap_result, dict):
+                tap_detected = tap_result.get('detected', False)
+                if tap_result.get('detections'):
+                    annotations['text'].extend(tap_result['detections'])
+            else:
+                tap_detected = tap_result if isinstance(tap_result, bool) else False
+            logger.info(f"  - 'tap' text detected: {tap_detected}")
+            
+            select_server_result = self._detect_select_server_button_debug(screenshot) if debug else self._detect_select_server_button(screenshot)
+            if debug and isinstance(select_server_result, dict):
+                select_server_button_detected = select_server_result.get('detected', False)
+                if select_server_result.get('position'):
+                    annotations['templates'].append({
+                        'name': 'select_server_button',
+                        'position': select_server_result['position'],
+                        'confidence': select_server_result.get('confidence', 0),
+                        'size': select_server_result.get('size', (100, 100)),
+                        'below_threshold': select_server_result.get('below_threshold', False)
+                    })
+            else:
+                select_server_button_detected = select_server_result if isinstance(select_server_result, bool) else False
+            logger.info(f"  - select_server_button.png detected: {select_server_button_detected}")
+            
+            if tap_detected and select_server_button_detected:
+                detected_state = 'select_server'
+                logger.info(f"Game state detected: {detected_state} (tap text + select_server_button.png)")
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                    self._save_template_images(['select_server_button.png'])
+                return detected_state
+            
+            # Rule 2: Check for "Character" text AND enter_button.png
+            logger.info("Rule 2: Checking for 'Character' text and enter_button.png...")
+            character_result = self._detect_character_text_debug(screenshot) if debug else self._detect_character_text(screenshot)
+            if debug and isinstance(character_result, dict):
+                character_text_detected = character_result.get('detected', False)
+                if character_result.get('detections'):
+                    annotations['text'].extend(character_result['detections'])
+            else:
+                character_text_detected = character_result if isinstance(character_result, bool) else False
+            logger.info(f"  - 'Character' text detected: {character_text_detected}")
+            
+            enter_result = self._detect_enter_button_debug(screenshot) if debug else self._detect_enter_button(screenshot)
+            if debug and isinstance(enter_result, dict):
+                enter_button_detected = enter_result.get('detected', False)
+                if enter_result.get('position'):
+                    annotations['templates'].append({
+                        'name': 'enter_button',
+                        'position': enter_result['position'],
+                        'confidence': enter_result.get('confidence', 0),
+                        'size': enter_result.get('size', (100, 100)),
+                        'below_threshold': enter_result.get('below_threshold', False)
+                    })
+            else:
+                enter_button_detected = enter_result if isinstance(enter_result, bool) else False
+            logger.info(f"  - enter_button.png detected: {enter_button_detected}")
+            
+            if character_text_detected and enter_button_detected:
+                detected_state = 'select_character'
+                logger.info(f"Game state detected: {detected_state} (Character text + enter_button.png)")
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                    self._save_template_images(['enter_button.png'])
+                return detected_state
+            
+            # Rule 3: Check for short_button.png
+            logger.info("Rule 3: Checking for short_button.png...")
+            fight_result = self._detect_fight_button_debug(screenshot) if debug else self._detect_fight_button(screenshot)
+            if debug and isinstance(fight_result, dict):
+                fight_button_detected = fight_result.get('detected', False)
+                if fight_result.get('position'):
+                    annotations['templates'].append({
+                        'name': 'short_button',
+                        'position': fight_result['position'],
+                        'confidence': fight_result.get('confidence', 0),
+                        'size': fight_result.get('size', (100, 100)),
+                        'below_threshold': fight_result.get('below_threshold', False)
+                    })
+            else:
+                fight_button_detected = fight_result if isinstance(fight_result, bool) else False
+            logger.info(f"  - short_button.png detected: {fight_button_detected}")
+            
+            if fight_button_detected:
+                detected_state = 'playing'
+                logger.info(f"Game state detected: {detected_state} (short_button.png)")
+                
+                # After detecting "playing" state, check if player is fighting
+                logger.info("Checking if player is fighting...")
+                is_fighting, fighting_details = self.detect_fighting_state(screenshot)
+                if is_fighting:
+                    logger.info(f"Player is fighting - Reason: {fighting_details.get('reason', 'unknown')}")
+                else:
+                    logger.info(f"Player is not fighting - Reason: {fighting_details.get('reason', 'unknown')}")
+                
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                    self._save_template_images(['short_button.png'])
+                    # Include fighting state in detection results
+                    annotations['fighting_state'] = {
+                        'is_fighting': is_fighting,
+                        'details': fighting_details
+                    }
+                
+                return detected_state
+            
+            # No matching state found
+            detected_state = 'unknown'
+            logger.info("Game state not determined from screenshot elements - returning 'unknown'")
+            logger.info(f"  Detection Summary:")
+            logger.info(f"    - tap text: {tap_detected}")
+            logger.info(f"    - select_server_button: {select_server_button_detected}")
+            logger.info(f"    - character text: {character_text_detected}")
+            logger.info(f"    - enter_button: {enter_button_detected}")
+            logger.info(f"    - short_button: {fight_button_detected}")
+            logger.info(f"  Result: {detected_state}")
+            
+            if debug:
+                self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                self._save_template_images(['select_server_button.png', 'enter_button.png', 'short_button.png'])
+                self._save_detection_results({
+                    'detected_state': detected_state,
+                    'tap_detected': tap_detected,
+                    'select_server_button_detected': select_server_button_detected,
+                    'character_text_detected': character_text_detected,
+                    'enter_button_detected': enter_button_detected,
+                    'short_button_detected': fight_button_detected,
+                    'annotations': annotations
+                })
+            
+            return detected_state
+            
+        except Exception as e:
+            logger.error(f"Error detecting game state from screenshot: {e}", exc_info=True)
+            return 'unknown'
+    
+    def _save_debug_screenshot(self, screenshot: np.ndarray, suffix: str, annotations: dict = None):
+        """
+        Save screenshot for debugging purposes with optional annotations
+        
+        Args:
+            screenshot: OpenCV image array
+            suffix: Suffix for filename
+            annotations: Dictionary with annotation data:
+                - 'templates': List of {'name': str, 'position': (x, y), 'confidence': float}
+                - 'text': List of {'text': str, 'bbox': (x1, y1, x2, y2), 'confidence': float}
+        """
+        try:
+            import datetime
+            debug_dir = Path('debug_screenshots')
+            debug_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            
+            # Create annotated screenshot if annotations provided
+            annotated_screenshot = screenshot.copy() if annotations else screenshot
+            
+            if annotations:
+                annotated_screenshot = self._draw_debug_annotations(annotated_screenshot, annotations)
+            
+            filename = debug_dir / f"screenshot_{timestamp}_{suffix}.png"
+            
+            # Try to save using cv2.imwrite, fallback to PIL
+            try:
+                if hasattr(cv2, 'imwrite'):
+                    cv2.imwrite(str(filename), annotated_screenshot)
+                else:
+                    from PIL import Image, ImageDraw, ImageFont
+                    # Convert BGR to RGB for PIL
+                    if len(annotated_screenshot.shape) == 3:
+                        rgb_image = annotated_screenshot[:, :, ::-1]
+                        pil_image = Image.fromarray(rgb_image)
+                    else:
+                        pil_image = Image.fromarray(annotated_screenshot)
+                    
+                    # Draw annotations using PIL if cv2 not available
+                    if annotations:
+                        pil_image = self._draw_debug_annotations_pil(pil_image, annotations)
+                    
+                    pil_image.save(filename)
+                logger.info(f"Debug screenshot saved: {filename}")
+            except Exception as e:
+                logger.warning(f"Failed to save debug screenshot: {e}")
+        except Exception as e:
+            logger.debug(f"Error saving debug screenshot: {e}")
+    
+    def _draw_debug_annotations(self, screenshot: np.ndarray, annotations: dict) -> np.ndarray:
+        """Draw debug annotations (boxes, labels) on screenshot using OpenCV"""
+        try:
+            annotated = screenshot.copy()
+            
+            # Draw template detections
+            if 'templates' in annotations:
+                for template_info in annotations['templates']:
+                    name = template_info.get('name', 'template')
+                    position = template_info.get('position')
+                    confidence = template_info.get('confidence', 0)
+                    template_size = template_info.get('size', (100, 100))  # Default size if not provided
+                    below_threshold = template_info.get('below_threshold', False)
+                    
+                    if position:
+                        x, y = position
+                        w, h = template_size
+                        
+                        # Draw rectangle - green if above threshold, yellow if below
+                        color = (0, 255, 255) if below_threshold else (0, 255, 0)  # Yellow or green
+                        if hasattr(cv2, 'rectangle'):
+                            cv2.rectangle(annotated, (x - w//2, y - h//2), (x + w//2, y + h//2), color, 2)
+                            # Draw label
+                            if hasattr(cv2, 'putText'):
+                                threshold_status = " (BELOW THRESHOLD)" if below_threshold else ""
+                                label = f"{name} ({confidence:.3f}){threshold_status}"
+                                font = cv2.FONT_HERSHEY_SIMPLEX if hasattr(cv2, 'FONT_HERSHEY_SIMPLEX') else 0
+                                cv2.putText(annotated, label, (x - w//2, y - h//2 - 10), 
+                                          font, 0.7, color, 2)
+                        else:
+                            # Fallback: draw using PIL later
+                            pass
+            
+            # Draw text detections
+            if 'text' in annotations:
+                for text_info in annotations['text']:
+                    text = text_info.get('text', '')
+                    bbox = text_info.get('bbox')
+                    confidence = text_info.get('confidence', 0)
+                    
+                    if bbox:
+                        x1, y1, x2, y2 = bbox
+                        
+                        # Draw rectangle
+                        if hasattr(cv2, 'rectangle'):
+                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                            # Draw label
+                            if hasattr(cv2, 'putText'):
+                                label = f"{text} ({confidence:.2f})"
+                                font = cv2.FONT_HERSHEY_SIMPLEX if hasattr(cv2, 'FONT_HERSHEY_SIMPLEX') else 0
+                                cv2.putText(annotated, label, (x1, y1 - 10), 
+                                          font, 0.7, (255, 0, 0), 2)
+                        else:
+                            # Fallback: draw using PIL later
+                            pass
+            
+            return annotated
+        except Exception as e:
+            logger.debug(f"Error drawing debug annotations: {e}")
+            return screenshot
+    
+    def _draw_debug_annotations_pil(self, pil_image, annotations: dict):
+        """Draw debug annotations using PIL (fallback when OpenCV not available)"""
+        try:
+            from PIL import ImageDraw, ImageFont
+            draw = ImageDraw.Draw(pil_image)
+            
+            # Draw template detections
+            if 'templates' in annotations:
+                for template_info in annotations['templates']:
+                    name = template_info.get('name', 'template')
+                    position = template_info.get('position')
+                    confidence = template_info.get('confidence', 0)
+                    template_size = template_info.get('size', (100, 100))
+                    below_threshold = template_info.get('below_threshold', False)
+                    
+                    if position:
+                        x, y = position
+                        w, h = template_size
+                        # Draw rectangle - yellow if below threshold, green if above
+                        color = 'yellow' if below_threshold else 'green'
+                        draw.rectangle([x - w//2, y - h//2, x + w//2, y + h//2], 
+                                      outline=color, width=2)
+                        # Draw label
+                        threshold_status = " (BELOW THRESHOLD)" if below_threshold else ""
+                        label = f"{name} ({confidence:.3f}){threshold_status}"
+                        draw.text((x - w//2, y - h//2 - 15), label, fill=color)
+            
+            # Draw text detections
+            if 'text' in annotations:
+                for text_info in annotations['text']:
+                    text = text_info.get('text', '')
+                    bbox = text_info.get('bbox')
+                    confidence = text_info.get('confidence', 0)
+                    
+                    if bbox:
+                        x1, y1, x2, y2 = bbox
+                        # Draw rectangle
+                        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
+                        # Draw label
+                        label = f"{text} ({confidence:.2f})"
+                        draw.text((x1, y1 - 15), label, fill='red')
+            
+            return pil_image
+        except Exception as e:
+            logger.debug(f"Error drawing debug annotations with PIL: {e}")
+            return pil_image
+    
+    def _save_detection_results(self, results: dict):
+        """Save detection results to a JSON file for debugging"""
+        try:
+            import json
+            import datetime
+            debug_dir = Path('debug_screenshots')
+            debug_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = debug_dir / f"detection_results_{timestamp}.json"
+            
+            with open(filename, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"Detection results saved: {filename}")
+        except Exception as e:
+            logger.debug(f"Error saving detection results: {e}")
+    
+    def get_detection_results(self, screenshot: np.ndarray) -> dict:
+        """
+        Get detailed detection results for debugging
+        
+        Args:
+            screenshot: OpenCV image array
+            
+        Returns:
+            Dictionary with detailed detection results
+        """
+        try:
+            results = {
+                'screenshot_shape': screenshot.shape if screenshot is not None else None,
+                'detections': {}
+            }
+            
+            # Rule 1
+            tap_detected = self._detect_tap_screen_text(screenshot)
+            select_server_button_detected = self._detect_select_server_button(screenshot)
+            results['detections']['rule1_select_server'] = {
+                'tap_text': tap_detected,
+                'select_server_button': select_server_button_detected,
+                'match': tap_detected and select_server_button_detected
+            }
+            
+            # Rule 2
+            character_text_detected = self._detect_character_text(screenshot)
+            enter_button_detected = self._detect_enter_button(screenshot)
+            results['detections']['rule2_select_character'] = {
+                'character_text': character_text_detected,
+                'enter_button': enter_button_detected,
+                'match': character_text_detected and enter_button_detected
+            }
+            
+            # Rule 3
+            fight_button_detected = self._detect_fight_button(screenshot)
+            results['detections']['rule3_playing'] = {
+                'short_button': fight_button_detected,
+                'match': fight_button_detected
+            }
+            
+            # Final state
+            detected_state = 'unknown'
+            if results['detections']['rule1_select_server']['match']:
+                detected_state = 'select_server'
+            elif results['detections']['rule2_select_character']['match']:
+                detected_state = 'select_character'
+            elif results['detections']['rule3_playing']['match']:
+                detected_state = 'playing'
+            
+            results['detected_state'] = detected_state
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error getting detection results: {e}", exc_info=True)
+            return {'error': str(e)}
+    
+    def _load_regions(self, device_id: str = None):
+        """Load region configurations from JSON file"""
+        try:
+            # Try to load device-specific region file
+            if device_id:
+                self.device_id = device_id
+                # Replace both colons and dots to match file naming convention
+                # e.g., "127.0.0.1:5555" -> "127_0_0_1_5555"
+                device_filename = device_id.replace(':', '_').replace('.', '_')
+                region_file = Path('config') / f'regions_{device_filename}.json'
+                logger.debug(f"Attempting to load regions from: {region_file}")
+            else:
+                region_file = Path('config') / 'regions.json'
+            
+            if region_file.exists():
+                with open(region_file, 'r') as f:
+                    self.regions = json.load(f)
+                logger.info(f"Loaded {len(self.regions)} region types from {region_file}")
+                # Log available region names for debugging
+                if self.regions:
+                    logger.debug(f"Available regions: {list(self.regions.keys())}")
+            else:
+                logger.warning(f"Region file not found: {region_file}")
+                self.regions = {}
+        except Exception as e:
+            logger.warning(f"Failed to load regions from {region_file if 'region_file' in locals() else 'unknown file'}: {e}")
+            self.regions = {}
+    
+    def _get_region(self, region_name: str) -> Optional[Tuple[int, int, int, int]]:
+        """Get region coordinates for a named region"""
+        if not self.regions and self.adb.device_id:
+            self._load_regions(self.adb.device_id)
+        
+        if region_name in self.regions and self.regions[region_name]:
+            region_list = self.regions[region_name]
+            if region_list and len(region_list) > 0:
+                region = region_list[0]
+                if len(region) == 4:
+                    return tuple(region)
+        return None
+    
+    def _detect_game_state_enhanced(self, screenshot: np.ndarray) -> Optional[str]:
+        """
+        Enhanced game state detection using image templates, OCR text, and region analysis
+        
+        Args:
+            screenshot: Full resolution screenshot
+            
+        Returns:
+            Detected game state string or None
+        """
+        try:
+            # Load regions if not loaded
+            if not self.regions and self.adb.device_id:
+                self._load_regions(self.adb.device_id)
+            
+            # 1. Check for UI elements using template matching
+            ui_elements_found = self._detect_ui_elements(screenshot)
+            
+            # 2. Check for text patterns using OCR
+            text_based_state = self._detect_state_from_text(screenshot)
+            
+            # 3. Check for specific regions (health bar, control buttons, etc.)
+            region_based_state = self._detect_state_from_regions(screenshot)
+            
+            # 4. Combine evidence to determine state
+            state = self._combine_state_evidence(ui_elements_found, text_based_state, region_based_state)
+            
+            return state
+            
+        except Exception as e:
+            logger.debug(f"Error in enhanced state detection: {e}")
+            return None
+    
+    def _detect_ui_elements(self, screenshot: np.ndarray) -> Dict[str, bool]:
+        """
+        Detect UI elements using template matching
+        
+        Returns:
+            Dictionary of detected UI elements
+        """
+        detected = {
+            'health_bar': False,
+            'control_buttons': False,
+            'quest_panel': False,
+            'inventory': False,
+            'menu': False
+        }
+        
+        try:
+            # Check for health bar region (indicates in-game)
+            health_bar_region = self._get_region('health_bar')
+            if health_bar_region:
+                x1, y1, x2, y2 = health_bar_region
+                if x2 > x1 and y2 > y1:
+                    # Check if region has content (not empty)
+                    health_area = screenshot[y1:y2, x1:x2]
+                    if health_area.size > 0:
+                        # Check if health bar is visible (has color variation)
+                        gray = _bgr_to_gray(health_area)
+                        std_dev = np.std(gray)
+                        if std_dev > 10:  # Has variation (not solid color)
+                            detected['health_bar'] = True
+            
+            # Check for control buttons region (indicates in-game)
+            control_buttons_region = self._get_region('control_buttons')
+            if control_buttons_region:
+                x1, y1, x2, y2 = control_buttons_region
+                if x2 > x1 and y2 > y1:
+                    control_area = screenshot[y1:y2, x1:x2]
+                    if control_area.size > 0:
+                        # Check for button-like elements (edges/corners)
+                        gray = _bgr_to_gray(control_area)
+                        edges = _canny_edge_detection(gray, 50, 150)
+                        edge_density = np.sum(edges > 0) / edges.size
+                        if edge_density > 0.05:  # Has enough edges (buttons visible)
+                            detected['control_buttons'] = True
+                        del edges
+                        del gray
+            
+            # Check for quest panel region
+            quests_region = self._get_region('quests')
+            if quests_region:
+                x1, y1, x2, y2 = quests_region
+                if x2 > x1 and y2 > y1:
+                    quest_area = screenshot[y1:y2, x1:x2]
+                    if quest_area.size > 0:
+                        detected['quest_panel'] = True
+            
+            # Note: Menu detection can be added here using OCR or region-based detection if needed
+            # For now, we rely on region-based and text-based state detection
+            
+            return detected
+            
+        except Exception as e:
+            logger.debug(f"Error detecting UI elements: {e}")
+            return detected
+    
+    def _detect_state_from_text(self, screenshot: np.ndarray) -> Optional[str]:
+        """
+        Detect game state from OCR text patterns
+        
+        Returns:
+            Detected state string or None
+        """
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return None
+            
+            # Perform OCR on full resolution screenshot
+            results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
+            
+            # Extract all text
+            all_text = " ".join([text for (bbox, text, conf) in results]).lower()
+            
+            # Check each state pattern
+            for state, patterns in self.state_text_patterns.items():
+                for pattern in patterns:
+                    if pattern in all_text:
+                        logger.debug(f"State '{state}' detected from text pattern: '{pattern}'")
+                        return state
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error detecting state from text: {e}")
+            return None
+    
+    def detect_fighting_state(self, screenshot: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Detect if the player is currently fighting/in combat
+        
+        This method should be called after detecting "playing" state to determine
+        if the player is actively fighting or just idle in-game.
+        
+        The main indicator is the auto-hunt button's rotating light ring effect,
+        which appears when auto-hunt is active.
+        
+        Args:
+            screenshot: OpenCV image array (full screenshot)
+            
+        Returns:
+            Tuple of (is_fighting: bool, details: dict) where details contains:
+            - 'auto_hunt_active': bool - Rotating light ring detected on auto-hunt button
+            - 'reason': str - Reason for fighting/not fighting detection
+        """
+        try:
+            details = {
+                'auto_hunt_active': False,
+                'reason': 'unknown'
+            }
+            
+            # Method 1: Check if auto-hunt button has rotating light ring effect
+            # The rotating light ring indicates auto-hunt is active = fighting
+            auto_hunt_active = self._detect_auto_hunt_light_ring(screenshot)
+            if auto_hunt_active:
+                details['auto_hunt_active'] = True
+                details['reason'] = 'auto_hunt_light_ring_active'
+                logger.info("Fighting state detected: Auto-hunt button has rotating light ring (auto-hunt active)")
+                return True, details
+            
+            # Method 2: Check health bar region for damage indicators
+            # Health bar showing damage might indicate recent combat
+            health_bar_region = self._get_region('health_bar')
+            if health_bar_region:
+                x1, y1, x2, y2 = health_bar_region
+                # Ensure coordinates are within screenshot bounds
+                x1 = max(0, min(x1, screenshot.shape[1]))
+                y1 = max(0, min(y1, screenshot.shape[0]))
+                x2 = max(0, min(x2, screenshot.shape[1]))
+                y2 = max(0, min(y2, screenshot.shape[0]))
+                
+                if x2 > x1 and y2 > y1:
+                    health_area = screenshot[y1:y2, x1:x2]
+                    if health_area.size > 0:
+                        # Check if health bar shows damage (not full HP)
+                        # Health bars typically have green (full HP) and red (damage/missing HP)
+                        # Convert to HSV to detect red color (damage indicator)
+                        hsv = _bgr_to_hsv(health_area)
+                        
+                        # Red color in HSV: hue around 0-10 or 170-180, with sufficient saturation
+                        hue = hsv[:, :, 0]
+                        saturation = hsv[:, :, 1]
+                        value = hsv[:, :, 2]
+                        
+                        # Red mask: hue in red range AND sufficient saturation AND brightness
+                        red_mask = ((hue < 10) | (hue > 170)) & (saturation > 50) & (value > 50)
+                        red_pixels = np.sum(red_mask)
+                        total_pixels = health_area.shape[0] * health_area.shape[1]
+                        red_ratio = red_pixels / total_pixels if total_pixels > 0 else 0
+                        
+                        # Also check for green (full health) - if mostly green, probably not taking damage
+                        green_mask = (hue > 50) & (hue < 70) & (saturation > 50) & (value > 50)
+                        green_pixels = np.sum(green_mask)
+                        green_ratio = green_pixels / total_pixels if total_pixels > 0 else 0
+                        
+                        # If significant red is present and not mostly green, might indicate damage
+                        if red_ratio > 0.15 and green_ratio < 0.7:  # 15% red and less than 70% green
+                            details['reason'] = 'health_bar_shows_damage'
+                            logger.info(f"Fighting state detected: Health bar shows damage (red: {red_ratio:.2f}, green: {green_ratio:.2f})")
+                            return True, details
+            
+            # No fighting indicators found
+            details['reason'] = 'no_combat_indicators'
+            logger.debug("No fighting state detected - player appears idle")
+            return False, details
+            
+        except Exception as e:
+            logger.debug(f"Error detecting fighting state: {e}")
+            return False, {'reason': f'error: {str(e)}'}
+    
+    def _detect_auto_hunt_light_ring(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect the rotating light ring effect on the auto-hunt button
+        
+        The auto-hunt button has a rotating light ring effect when active.
+        This effect can be detected by looking for:
+        1. Bright, saturated colors (yellow/orange/white) in a circular pattern
+        2. High brightness variation in the button region
+        3. Specific color patterns that indicate the light ring
+        
+        Args:
+            screenshot: OpenCV image array (full screenshot)
+            
+        Returns:
+            True if rotating light ring is detected (auto-hunt active), False otherwise
+        """
+        try:
+            # Get control_buttons region where auto-hunt button is located
+            control_buttons_region = self._get_region('control_buttons')
+            if not control_buttons_region:
+                logger.debug("control_buttons region not configured - cannot detect auto-hunt light ring")
+                return False
+            
+            x1, y1, x2, y2 = control_buttons_region
+            # Ensure coordinates are within screenshot bounds
+            x1 = max(0, min(x1, screenshot.shape[1]))
+            y1 = max(0, min(y1, screenshot.shape[0]))
+            x2 = max(0, min(x2, screenshot.shape[1]))
+            y2 = max(0, min(y2, screenshot.shape[0]))
+            
+            if x2 <= x1 or y2 <= y1:
+                logger.debug("Invalid control_buttons region coordinates")
+                return False
+            
+            # Extract control buttons region
+            control_area = screenshot[y1:y2, x1:x2]
+            
+            if control_area.size == 0:
+                return False
+            
+            # Try to find auto_hunt_button first to get its position
+            # Then analyze the area around it for the light ring effect
+            search_region = (x1, y1, x2 - x1, y2 - y1)
+            button_result = self.template_matcher.find_template(
+                screenshot,
+                "auto_hunt_button.png",
+                confidence=0.6,  # Lower threshold to find button even with light ring
+                region=search_region,
+                multi_scale=True
+            )
+            
+            if not button_result:
+                logger.debug("Auto-hunt button not found in control_buttons region")
+                return False
+            
+            button_x, button_y, button_confidence = button_result
+            logger.debug(f"Auto-hunt button found at ({button_x}, {button_y}) with confidence {button_confidence:.3f}")
+            
+            # Load template to get button size
+            template = self.template_matcher.load_template("auto_hunt_button.png")
+            if template is None:
+                logger.debug("Could not load auto_hunt_button template")
+                return False
+            
+            template_h, template_w = template.shape[:2]
+            
+            # Calculate button region in screenshot coordinates
+            button_center_x = int(button_x)
+            button_center_y = int(button_y)
+            
+            # Extract a region around the button (larger than button to include light ring)
+            # Light ring typically extends 10-20 pixels beyond the button
+            ring_margin = 25
+            analysis_x1 = max(x1, button_center_x - template_w // 2 - ring_margin)
+            analysis_y1 = max(y1, button_center_y - template_h // 2 - ring_margin)
+            analysis_x2 = min(x2, button_center_x + template_w // 2 + ring_margin)
+            analysis_y2 = min(y2, button_center_y + template_h // 2 + ring_margin)
+            
+            if analysis_x2 <= analysis_x1 or analysis_y2 <= analysis_y1:
+                logger.debug("Invalid button analysis region")
+                return False
+            
+            button_analysis_area = screenshot[analysis_y1:analysis_y2, analysis_x1:analysis_x2]
+            
+            if button_analysis_area.size == 0:
+                return False
+            
+            # Convert to HSV for better color analysis
+            hsv = _bgr_to_hsv(button_analysis_area)
+            hue = hsv[:, :, 0]
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+            
+            # Rotating light ring typically has:
+            # 1. High brightness (value > 200)
+            # 2. High saturation (saturation > 150)
+            # 3. Yellow/orange/white colors (hue around 15-30 for yellow/orange, or low saturation for white)
+            
+            # Detect bright, saturated yellow/orange colors (common in light rings)
+            yellow_orange_mask = (
+                (hue >= 15) & (hue <= 30) &  # Yellow/orange hue range
+                (saturation > 150) &  # High saturation
+                (value > 200)  # High brightness
+            )
+            
+            # Detect bright white/light colors (also common in light rings)
+            white_light_mask = (
+                (saturation < 50) &  # Low saturation (white/gray)
+                (value > 220)  # Very high brightness
+            )
+            
+            # Combine both masks
+            light_ring_mask = yellow_orange_mask | white_light_mask
+            
+            # Count light ring pixels
+            light_pixels = np.sum(light_ring_mask)
+            total_pixels = button_analysis_area.shape[0] * button_analysis_area.shape[1]
+            light_ratio = light_pixels / total_pixels if total_pixels > 0 else 0
+            
+            # Also check for high brightness variation (indicating animated/rotating effect)
+            brightness_std = np.std(value)
+            brightness_mean = np.mean(value)
+            
+            # Rotating light rings typically have:
+            # - Significant bright pixels (light_ratio > 0.05)
+            # - High brightness variation (std > 40) due to rotation
+            # - High average brightness (mean > 150)
+            
+            logger.debug(f"Light ring detection: light_ratio={light_ratio:.3f}, brightness_std={brightness_std:.1f}, brightness_mean={brightness_mean:.1f}")
+            
+            if light_ratio > 0.05 and brightness_std > 40 and brightness_mean > 150:
+                logger.info(f"Rotating light ring detected on auto-hunt button (light_ratio: {light_ratio:.3f}, brightness_std: {brightness_std:.1f})")
+                return True
+            
+            logger.debug("No rotating light ring detected on auto-hunt button")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error detecting auto-hunt light ring: {e}")
+            return False
+    
+    def detect_auto_hunt_in_control_buttons(self, screenshot: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        """
+        Detect auto_hunt_button image in the control_buttons region using template matching
+        
+        Args:
+            screenshot: Full resolution screenshot
+            
+        Returns:
+            Tuple of (is_detected, position) where position is (center_x, center_y) if found, None otherwise
+        """
+        try:
+            # Get control_buttons region
+            control_buttons_region = self._get_region('control_buttons')
+            if not control_buttons_region:
+                logger.debug("control_buttons region not configured")
+                return False, None
+            
+            x1, y1, x2, y2 = control_buttons_region
+            # Ensure coordinates are within screenshot bounds
+            x1 = max(0, min(x1, screenshot.shape[1]))
+            y1 = max(0, min(y1, screenshot.shape[0]))
+            x2 = max(0, min(x2, screenshot.shape[1]))
+            y2 = max(0, min(y2, screenshot.shape[0]))
+            
+            if x2 <= x1 or y2 <= y1:
+                logger.debug("Invalid control_buttons region coordinates")
+                return False, None
+            
+            # Convert region to (x, y, width, height) format for template matcher
+            region_width = x2 - x1
+            region_height = y2 - y1
+            search_region = (x1, y1, region_width, region_height)
+            
+            # Try to find auto_hunt_button template in the control_buttons region
+            # Use the actual template file name from assets/templates
+            result = self.template_matcher.find_template(
+                screenshot,
+                "auto_hunt_button.png",
+                confidence=0.7,  # Minimum confidence threshold
+                region=search_region,
+                multi_scale=True
+            )
+            
+            if result:
+                center_x, center_y, confidence = result
+                logger.info(f"Detected auto_hunt_button image in control_buttons region at ({center_x}, {center_y}) (confidence: {confidence:.3f})")
+                return True, (center_x, center_y)
+            
+            logger.debug("auto_hunt_button image not detected in control_buttons region")
+            return False, None
+                    
+        except Exception as e:
+            logger.debug(f"Error detecting AUTO HUNT button in control buttons: {e}")
+            return False, None
+    
+    def _detect_state_from_regions(self, screenshot: np.ndarray) -> Optional[str]:
+        """
+        Detect game state based on visible regions
+        
+        Returns:
+            Detected state string or None
+        """
+        try:
+            # Check for key regions that indicate in-game state
+            health_bar = self._get_region('health_bar')
+            control_buttons = self._get_region('control_buttons')
+            player_region = self._get_region('player')
+            
+            if health_bar and control_buttons:
+                # Both health bar and control buttons visible = in-game
+                x1, y1, x2, y2 = health_bar
+                if x2 > x1 and y2 > y1:
+                    health_area = screenshot[y1:y2, x1:x2]
+                    if health_area.size > 0:
+                        # Check if health bar has content
+                        gray = _bgr_to_gray(health_area)
+                        if np.std(gray) > 10:  # Has variation
+                            logger.debug("In-game state detected: health bar and control buttons visible")
+                            return 'in_game'
+            
+            # Check for player region (character visible)
+            if player_region:
+                x1, y1, x2, y2 = player_region
+                if x2 > x1 and y2 > y1:
+                    player_area = screenshot[y1:y2, x1:x2]
+                    if player_area.size > 0:
+                        # Check if player area has significant content (not empty)
+                        gray = _bgr_to_gray(player_area)
+                        avg_brightness = np.mean(gray)
+                        std_dev = np.std(gray)
+                        if std_dev > 15 and 50 < avg_brightness < 200:  # Has content
+                            logger.debug("In-game state detected: player region visible")
+                            return 'in_game'
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error detecting state from regions: {e}")
+            return None
+    
+    def _combine_state_evidence(self, ui_elements: Dict[str, bool], 
+                               text_state: Optional[str],
+                               region_state: Optional[str]) -> Optional[str]:
+        """
+        Combine multiple evidence sources to determine game state
+        
+        Returns:
+            Final determined game state
+        """
+        # Priority 1: Region-based detection (most reliable)
+        if region_state:
+            return region_state
+        
+        # Priority 2: Text-based detection
+        if text_state:
+            return text_state
+        
+        # Priority 3: UI element detection
+        if ui_elements.get('health_bar') and ui_elements.get('control_buttons'):
+            return 'in_game'
+        elif ui_elements.get('menu'):
+            return 'main_menu'
+        elif ui_elements.get('quest_panel'):
+            return 'in_game_with_ui'
+        
+        # Default: unknown state
+        return None
+    
     def _analyze_screenshot(self, screenshot: np.ndarray) -> Dict:
         """
         Analyze screenshot for game-specific elements
@@ -253,19 +1858,36 @@ class GameDetector:
             screenshot_small = screenshot
             
             # Convert to different color spaces for analysis
-            hsv_image = cv2.cvtColor(screenshot_small, cv2.COLOR_BGR2HSV)
-            gray_image = cv2.cvtColor(screenshot_small, cv2.COLOR_BGR2GRAY)
+            hsv_image = _bgr_to_hsv(screenshot_small)
+            gray_image = _bgr_to_gray(screenshot_small)
             
             # Analyze dominant colors
             analysis['colors'] = self._analyze_colors(screenshot_small)
             
             # Detect UI elements (basic edge detection)
-            edges = cv2.Canny(gray_image, 50, 150)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Count significant contours (potential UI elements)
-            significant_contours = [c for c in contours if cv2.contourArea(c) > 100]
-            analysis['ui_elements'] = len(significant_contours)
+            edges = _canny_edge_detection(gray_image, 50, 150)
+            contours = None  # Initialize contours variable
+            try:
+                if hasattr(cv2, 'findContours') and hasattr(cv2, 'RETR_EXTERNAL') and hasattr(cv2, 'CHAIN_APPROX_SIMPLE'):
+                    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    # Count significant contours (potential UI elements)
+                    if hasattr(cv2, 'contourArea'):
+                        significant_contours = [c for c in contours if cv2.contourArea(c) > 100]
+                        analysis['ui_elements'] = len(significant_contours)
+                    else:
+                        # Fallback: use edge density as proxy for UI elements
+                        edge_density = np.sum(edges > 0) / edges.size
+                        analysis['ui_elements'] = int(edge_density * 1000)  # Scale to approximate count
+                else:
+                    # Fallback: use edge density as proxy for UI elements
+                    edge_density = np.sum(edges > 0) / edges.size
+                    analysis['ui_elements'] = int(edge_density * 1000)  # Scale to approximate count
+            except Exception as e:
+                logger.debug(f"Error detecting contours: {e}")
+                # Fallback: use edge density as proxy for UI elements
+                edge_density = np.sum(edges > 0) / edges.size
+                analysis['ui_elements'] = int(edge_density * 1000)  # Scale to approximate count
             
             # Basic game state detection based on colors and layout
             analysis['menu_state'] = self._detect_menu_state(screenshot_small, hsv_image)
@@ -299,18 +1921,20 @@ class GameDetector:
         """
         try:
             # Resize image for faster processing
-            small_image = cv2.resize(image, (100, 100))
+            small_image = _resize_image(image, (100, 100))
             
             # Calculate mean colors
             mean_color = np.mean(small_image, axis=(0, 1))
             
             # Convert to different color spaces
-            hsv_mean = cv2.cvtColor(np.uint8([[mean_color]]), cv2.COLOR_BGR2HSV)[0][0]
+            # Convert single color value to HSV
+            color_array = np.uint8([[mean_color]])
+            hsv_mean = _bgr_to_hsv(color_array)[0][0]
             
             return {
                 'mean_bgr': mean_color.tolist(),
                 'mean_hsv': hsv_mean.tolist(),
-                'brightness': float(np.mean(cv2.cvtColor(small_image, cv2.COLOR_BGR2GRAY))),
+                'brightness': float(np.mean(_bgr_to_gray(small_image))),
                 'saturation': float(hsv_mean[1])
             }
         except Exception as e:
@@ -337,9 +1961,9 @@ class GameDetector:
             center_region = image[height//4:3*height//4, width//4:3*width//4]
             
             # Analyze regions
-            top_brightness = np.mean(cv2.cvtColor(top_region, cv2.COLOR_BGR2GRAY))
-            bottom_brightness = np.mean(cv2.cvtColor(bottom_region, cv2.COLOR_BGR2GRAY))
-            center_brightness = np.mean(cv2.cvtColor(center_region, cv2.COLOR_BGR2GRAY))
+            top_brightness = np.mean(_bgr_to_gray(top_region))
+            bottom_brightness = np.mean(_bgr_to_gray(bottom_region))
+            center_brightness = np.mean(_bgr_to_gray(center_region))
             
             # Basic heuristics for menu detection
             if top_brightness > 200 and bottom_brightness > 200:

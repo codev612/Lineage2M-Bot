@@ -64,15 +64,43 @@ def get_logger(name: str, level: str = "INFO",
     
     # Console handler with UTF-8 encoding support
     if console_output:
-        # Use UTF-8 encoding for console output to handle emojis
+        # Create a custom handler that safely handles Unicode characters
+        class SafeStreamHandler(logging.StreamHandler):
+            """StreamHandler that safely handles Unicode encoding errors"""
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    stream = self.stream
+                    stream.write(msg + self.terminator)
+                    self.flush()
+                except UnicodeEncodeError:
+                    # If Unicode encoding fails, replace problematic characters
+                    try:
+                        msg = self.format(record)
+                        # Replace Unicode characters that can't be encoded (emojis, etc.)
+                        safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
+                        stream = self.stream
+                        stream.write(safe_msg + self.terminator)
+                        self.flush()
+                    except Exception:
+                        # If even that fails, just skip this log message
+                        self.handleError(record)
+                except Exception:
+                    # Handle any other errors
+                    self.handleError(record)
+        
         try:
+            # Try to use UTF-8 encoding
             import io
-            console_handler = logging.StreamHandler(
-                io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-            )
-        except (AttributeError, io.UnsupportedOperation):
-            # Fallback to regular handler if buffer not available
-            console_handler = logging.StreamHandler(sys.stdout)
+            if hasattr(sys.stdout, 'buffer'):
+                console_handler = SafeStreamHandler(
+                    io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+                )
+            else:
+                console_handler = SafeStreamHandler(sys.stdout)
+        except (AttributeError, io.UnsupportedOperation, Exception):
+            # Fallback to safe handler with system stdout
+            console_handler = SafeStreamHandler(sys.stdout)
         
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)

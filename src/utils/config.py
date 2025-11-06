@@ -25,6 +25,7 @@ class ADBConfig:
     screenshot_timeout: int = 10
     connection_retry_count: int = 3
     connection_retry_delay: float = 2.0
+    adb_path: Optional[str] = None  # Optional path to ADB executable. If None, will auto-detect.
 
 @dataclass
 class BlueStacksConfig:

@@ -3,7 +3,7 @@ Multi-Device Manager - Manage multiple Android devices simultaneously
 Provides parallel device management and control for bot operations
 """
 
-from typing import List, Dict, Set, Optional, Any
+from typing import List, Dict, Set, Optional, Any, Tuple
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,10 +27,17 @@ class DeviceSession:
         self.last_activity = time.time()
         self.lock = threading.Lock()
         
-    def connect(self) -> bool:
-        """Connect to this device"""
+    def connect(self) -> tuple[bool, Optional[str]]:
+        """
+        Connect to this device
+        
+        Returns:
+            Tuple of (success: bool, actual_device_id: Optional[str])
+            If device was discovered at a different port, actual_device_id will be the discovered device_id
+        """
         with self.lock:
             try:
+                original_device_id = self.device_id
                 logger.info(f"Connecting to device: {self.device_id}")
                 if self.adb.connect_to_device(self.device_id):
                     self.connected = True
@@ -38,18 +45,24 @@ class DeviceSession:
                     # Verify device_id is actually set in ADBManager
                     if self.adb.device_id == self.device_id:
                         logger.info(f"Successfully connected to {self.device_id} (device_id verified)")
+                        return True, self.device_id
                     else:
-                        logger.warning(f"Connected but device_id mismatch! Expected {self.device_id}, got {self.adb.device_id}")
-                        # Fix it
-                        self.adb.device_id = self.device_id
-                        logger.info(f"Fixed device_id to {self.device_id}")
-                    return True
+                        # Device was discovered at a different port (e.g., requested 5575 but found 5555)
+                        discovered_device_id = self.adb.device_id
+                        logger.warning(f"Device discovered at different port! Requested {self.device_id}, discovered {discovered_device_id}")
+                        
+                        # Update our device_id to match the discovered device
+                        old_device_id = self.device_id
+                        self.device_id = discovered_device_id
+                        self.device_info['id'] = discovered_device_id
+                        logger.info(f"Updated DeviceSession device_id from {old_device_id} to {discovered_device_id}")
+                        return True, discovered_device_id
                 else:
                     logger.error(f"Failed to connect to {self.device_id}")
-                    return False
+                    return False, None
             except Exception as e:
                 logger.error(f"Error connecting to {self.device_id}: {e}", exc_info=True)
-                return False
+                return False, None
     
     def disconnect(self):
         """Disconnect from this device"""
@@ -133,27 +146,50 @@ class MultiDeviceManager:
         """Discover all available devices"""
         return self.device_manager.discover_devices_with_game_priority()
     
-    def connect_device(self, device_id: str, device_info: Dict[str, Any]) -> bool:
-        """Connect to a specific device"""
+    def connect_device(self, device_id: str, device_info: Dict[str, Any]) -> Optional[str]:
+        """
+        Connect to a specific device
+        
+        Returns:
+            Actual device_id if connected successfully (may differ if device was discovered at different port)
+            None if connection failed
+        """
         with self.lock:
             if device_id in self.connected_devices:
                 logger.warning(f"Device {device_id} already connected")
-                return self.connected_devices[device_id].is_connected()
+                if self.connected_devices[device_id].is_connected():
+                    return device_id
+                else:
+                    # Remove stale connection
+                    del self.connected_devices[device_id]
             
             # Check device limit
             max_devices = config_manager.config.max_devices
             if len(self.connected_devices) >= max_devices:
                 logger.warning(f"Cannot connect to {device_id}: Device limit reached ({max_devices})")
-                return False
+                return None
             
             # Create new device session
             session = DeviceSession(device_info)
-            if session.connect():
-                self.connected_devices[device_id] = session
-                logger.info(f"Added device session: {device_id} ({len(self.connected_devices)}/{max_devices} devices)")
-                return True
+            connected, actual_device_id = session.connect()
+            if connected:
+                # Use the actual device_id (may be different if device was discovered at different port)
+                actual_device_id = actual_device_id or device_id
+                if actual_device_id != device_id:
+                    # Device was discovered at a different port - update the key in connected_devices
+                    logger.info(f"Device port changed: {device_id} -> {actual_device_id}, updating device registry")
+                    # Remove old key if it exists
+                    if device_id in self.connected_devices:
+                        del self.connected_devices[device_id]
+                    self.connected_devices[actual_device_id] = session
+                    logger.info(f"Added device session: {actual_device_id} ({len(self.connected_devices)}/{max_devices} devices)")
+                    return actual_device_id  # Return the actual device_id
+                else:
+                    self.connected_devices[device_id] = session
+                    logger.info(f"Added device session: {device_id} ({len(self.connected_devices)}/{max_devices} devices)")
+                    return device_id
             else:
-                return False
+                return None
     
     def disconnect_device(self, device_id: str) -> bool:
         """Disconnect from a specific device"""

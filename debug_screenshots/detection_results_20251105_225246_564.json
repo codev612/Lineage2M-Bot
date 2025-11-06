@@ -1,0 +1,52 @@
+{
+  "detected_state": "unknown",
+  "tap_detected": false,
+  "select_server_button_detected": false,
+  "character_text_detected": false,
+  "enter_button_detected": false,
+  "short_button_detected": false,
+  "annotations": {
+    "templates": [
+      {
+        "name": "select_server_button",
+        "position": [
+          755,
+          15
+        ],
+        "confidence": 0.399027943611145,
+        "size": [
+          187,
+          53
+        ],
+        "below_threshold": true
+      },
+      {
+        "name": "enter_button",
+        "position": [
+          1779,
+          998
+        ],
+        "confidence": 0.38275185227394104,
+        "size": [
+          273,
+          58
+        ],
+        "below_threshold": true
+      },
+      {
+        "name": "short_button",
+        "position": [
+          362,
+          172
+        ],
+        "confidence": 0.14753295481204987,
+        "size": [
+          34,
+          47
+        ],
+        "below_threshold": true
+      }
+    ],
+    "text": []
+  }
+}

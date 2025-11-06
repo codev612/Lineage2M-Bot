@@ -18,10 +18,11 @@ class DeviceManager:
     """
     
     def __init__(self):
-        self.adb = ADBManager()
+        self.config = config_manager.get_config()
+        adb_path = self.config.adb.adb_path if hasattr(self.config.adb, 'adb_path') else None
+        self.adb = ADBManager(timeout=self.config.adb.timeout, adb_path=adb_path)
         self.selected_device: Optional[Dict] = None
         self.available_devices: List[Dict] = []
-        self.config = config_manager.get_config()
     
     def discover_devices(self) -> List[Dict[str, Any]]:
         """

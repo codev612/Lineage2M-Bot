@@ -7,6 +7,8 @@ import subprocess
 import time
 import re
 import logging
+import os
+import platform
 from typing import List, Optional, Tuple, Dict
 import cv2
 import numpy as np
@@ -24,41 +26,170 @@ class ADBManager:
     Manages ADB connections and operations for Android devices/emulators
     """
     
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 30, adb_path: Optional[str] = None):
         """
         Initialize ADB Manager
         
         Args:
             timeout: Default timeout for ADB operations in seconds
+            adb_path: Optional path to ADB executable. If None, will auto-detect.
         """
         self.device_id: Optional[str] = None
         self.connected = False
         self.timeout = timeout
+        self.adb_path: Optional[str] = adb_path
+        self._find_adb()
         self._validate_adb()
     
-    def _validate_adb(self) -> None:
-        """Validate that ADB is available in system PATH"""
-        if not self.check_adb_available():
-            raise ADBError("ADB not found in system PATH. Please install Android SDK Platform Tools.")
-    
-    def check_adb_available(self) -> bool:
-        """Check if ADB is available in system PATH"""
+    def _find_adb(self) -> None:
+        """
+        Find ADB executable in common locations.
+        Search order (priority):
+        1. User-provided ADB path (from config)
+        2. Standard ADB from system PATH
+        3. Standard Android SDK Platform Tools ADB
+        4. Device-specific ADB (BlueStacks, MuMu, LDPlayer, Nox) - fallback only
+        """
+        # Priority 1: If adb_path is provided and exists, use it
+        if self.adb_path:
+            adb_file = Path(self.adb_path)
+            if adb_file.exists() and adb_file.is_file():
+                self.adb_path = str(adb_file.absolute())
+                logger.info(f"Using provided ADB path: {self.adb_path}")
+                return
+            else:
+                logger.warning(f"Provided ADB path does not exist: {self.adb_path}, will search for ADB")
+        
+        # Priority 2: Try to find standard ADB in system PATH
         try:
             result = subprocess.run(['adb', 'version'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                self.adb_path = 'adb'  # Use 'adb' from PATH (standard ADB)
+                version = result.stdout.strip().split()[0]
+                logger.info(f"ADB found in PATH (standard ADB): {version}")
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        # Search common installation locations
+        search_paths = []
+        
+        # Windows paths
+        if platform.system() == 'Windows':
+            # Android SDK locations
+            local_appdata = os.getenv('LOCALAPPDATA', '')
+            userprofile = os.getenv('USERPROFILE', '')
+            program_files = os.getenv('ProgramFiles', '')
+            program_files_x86 = os.getenv('ProgramFiles(x86)', '')
+            
+            # Priority 3: Standard Android SDK Platform Tools ADB (works with all emulators)
+            search_paths.extend([
+                Path(local_appdata) / 'Android' / 'Sdk' / 'platform-tools' / 'adb.exe',
+                Path(userprofile) / 'AppData' / 'Local' / 'Android' / 'Sdk' / 'platform-tools' / 'adb.exe',
+                Path(program_files) / 'Android' / 'android-sdk' / 'platform-tools' / 'adb.exe',
+                Path(program_files_x86) / 'Android' / 'android-sdk' / 'platform-tools' / 'adb.exe',
+            ])
+            
+            # Priority 4: Device-specific ADB locations (FALLBACK if standard ADB not found)
+            # NOTE: Standard Android SDK ADB works with ALL emulators via network ports.
+            # These emulator-specific ADBs are fallbacks for users who don't have
+            # Android SDK Platform Tools installed.
+            # Best practice: Install Android SDK Platform Tools and use standard ADB.
+            search_paths.extend([
+                # LDPlayer (LD)
+                Path(program_files) / 'LDPlayer' / 'adb.exe',
+                Path(program_files_x86) / 'LDPlayer' / 'adb.exe',
+                Path(program_files) / 'LDPlayer4.0' / 'adb.exe',
+                Path(program_files_x86) / 'LDPlayer4.0' / 'adb.exe',
+                # BlueStacks
+                Path(program_files) / 'BlueStacks_nxt' / 'HD-Adb.exe',  # BlueStacks 5/nxt
+                Path(program_files) / 'BlueStacks' / 'HD-Adb.exe',  # Older BlueStacks
+                Path(program_files_x86) / 'BlueStacks_nxt' / 'HD-Adb.exe',
+                Path(program_files_x86) / 'BlueStacks' / 'HD-Adb.exe',
+                # MuMu Player
+                Path(program_files) / 'Netease' / 'MuMuPlayer' / 'nx_device' / '12.0' / 'shell' / 'adb.exe',
+                Path(program_files) / 'Netease' / 'MuMuPlayer' / 'shell' / 'adb.exe',
+                # Nox
+                Path(program_files) / 'Nox' / 'bin' / 'nox_adb.exe',
+                Path(program_files_x86) / 'Nox' / 'bin' / 'nox_adb.exe',
+            ])
+        
+        # Linux/Mac paths
+        else:
+            home = os.getenv('HOME', '')
+            search_paths.extend([
+                Path(home) / 'Android' / 'Sdk' / 'platform-tools' / 'adb',
+                Path(home) / 'Library' / 'Android' / 'sdk' / 'platform-tools' / 'adb',
+                Path('/opt' / 'android-sdk' / 'platform-tools' / 'adb'),
+                Path('/usr' / 'local' / 'bin' / 'adb'),
+            ])
+        
+        # Search for ADB in common locations (standard ADB first, then device-specific)
+        for adb_file in search_paths:
+            if adb_file.exists() and adb_file.is_file():
+                self.adb_path = str(adb_file.absolute())
+                # Determine if it's standard or device-specific ADB
+                adb_str = str(adb_file).lower()
+                if any(emu in adb_str for emu in ['bluestacks', 'mumu', 'ldplayer', 'nox']):
+                    logger.info(f"ADB found at (device-specific fallback): {self.adb_path}")
+                else:
+                    logger.info(f"ADB found at (standard SDK): {self.adb_path}")
+                return
+        
+        # If still not found, try to search in Program Files recursively (Windows only, slow)
+        if platform.system() == 'Windows' and not self.adb_path:
+            try:
+                import glob
+                for drive in ['C:']:
+                    pattern = f"{drive}\\Program Files\\**\\adb.exe"
+                    matches = glob.glob(pattern, recursive=True)
+                    if matches:
+                        self.adb_path = matches[0]
+                        logger.info(f"ADB found by search: {self.adb_path}")
+                        return
+            except Exception:
+                pass
+        
+        # If still not found, set to None and let validation handle the error
+        if not self.adb_path:
+            self.adb_path = None
+    
+    def _get_adb_command(self, args: List[str]) -> List[str]:
+        """Build ADB command with proper path"""
+        if self.adb_path:
+            return [self.adb_path] + args
+        else:
+            return ['adb'] + args
+    
+    def _validate_adb(self) -> None:
+        """Validate that ADB is available"""
+        if not self.check_adb_available():
+            error_msg = "ADB not found. Please install Android SDK Platform Tools or specify ADB path in config."
+            if self.adb_path:
+                error_msg += f"\nAttempted path: {self.adb_path}"
+            raise ADBError(error_msg)
+    
+    def check_adb_available(self) -> bool:
+        """Check if ADB is available"""
+        try:
+            cmd = self._get_adb_command(['version'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 version = result.stdout.strip().split()[0]
-                logger.info(f"ADB available: {version}")
+                logger.info(f"ADB available: {version} at {self.adb_path or 'PATH'}")
                 return True
             return False
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.error(f"ADB not found in PATH: {e}")
+            logger.error(f"ADB not found: {e}")
             return False
     
     def get_connected_devices(self) -> List[str]:
         """Get list of connected Android devices/emulators"""
         try:
-            result = subprocess.run(['adb', 'devices'], 
+            cmd = self._get_adb_command(['devices'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=self.timeout)
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')[1:]  # Skip header
@@ -86,9 +217,9 @@ class ADBManager:
             device_info['status'] = 'connected'
             devices.append(device_info)
         
-        # Try to discover BlueStacks instances
-        bluestacks_devices = self.discover_bluestacks_devices()
-        for bs_device in bluestacks_devices:
+        # Try to discover emulator instances (BlueStacks, LDPlayer, MuMu, etc.)
+        emulator_devices = self.discover_bluestacks_devices()
+        for bs_device in emulator_devices:
             # Check if already in connected devices
             if bs_device['id'] not in connected_devices:
                 bs_device['status'] = 'available'
@@ -97,33 +228,51 @@ class ADBManager:
         return devices
     
     def discover_bluestacks_devices(self) -> List[Dict]:
-        """Discover potential BlueStacks emulator instances"""
-        bluestacks_devices = []
-        bluestacks_ports = [5555, 5554, 5556, 5558, 5562, 5564, 5566, 5568]
+        """Discover potential emulator instances (BlueStacks, LDPlayer, MuMu, etc.)"""
+        emulator_devices = []
+        # Common ports for various emulators: BlueStacks, LDPlayer, MuMu, Nox
+        # Most emulators use ports starting from 5555, incrementing by 1 or 2
+        common_ports = [5555, 5554, 5556, 5558, 5562, 5564, 5566, 5568, 5570, 5572, 5574, 5576, 5578, 5580]
         
-        logger.info("Scanning for BlueStacks instances...")
+        logger.info("Scanning for emulator instances (BlueStacks, LDPlayer, MuMu, etc.)...")
         
-        for port in bluestacks_ports:
+        for port in common_ports:
             device_id = f"127.0.0.1:{port}"
             
             # Try to connect temporarily to test
             try:
-                result = subprocess.run(['adb', 'connect', device_id], 
+                cmd = self._get_adb_command(['connect', device_id])
+                result = subprocess.run(cmd, 
                                       capture_output=True, text=True, timeout=5)
                 
-                if result.returncode == 0:
+                if result.returncode == 0 and 'connected' in result.stdout.lower():
                     # Get device info if connection successful
                     device_info = self.get_device_detailed_info(device_id)
                     device_info['id'] = device_id
-                    device_info['type'] = 'BlueStacks'
                     device_info['port'] = port
-                    bluestacks_devices.append(device_info)
+                    
+                    # Better emulator type detection based on model/manufacturer
+                    model = device_info.get('model', '').lower()
+                    manufacturer = device_info.get('manufacturer', '').lower()
+                    
+                    if 'bluestacks' in model or 'bstk' in model or 'bluestacks' in manufacturer:
+                        device_info['type'] = 'BlueStacks'
+                    elif 'ldplayer' in model or 'ld' in model or 'ldplayer' in manufacturer:
+                        device_info['type'] = 'LDPlayer'
+                    elif 'mumu' in model or 'mumu' in manufacturer or 'netease' in manufacturer:
+                        device_info['type'] = 'MuMu Player'
+                    elif 'nox' in model or 'nox' in manufacturer:
+                        device_info['type'] = 'Nox Player'
+                    else:
+                        device_info['type'] = 'Emulator'
+                    
+                    emulator_devices.append(device_info)
                     
             except (subprocess.TimeoutExpired, Exception) as e:
                 # Port not available or no emulator running
                 continue
         
-        return bluestacks_devices
+        return emulator_devices
     
     def get_device_detailed_info(self, device_id: str) -> Dict:
         """Get detailed information about a specific device"""
@@ -139,40 +288,54 @@ class ADBManager:
         
         try:
             # Get model
-            result = subprocess.run(['adb', '-s', device_id, 'shell', 'getprop', 'ro.product.model'], 
+            cmd = self._get_adb_command(['-s', device_id, 'shell', 'getprop', 'ro.product.model'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 info['model'] = result.stdout.strip()
             
             # Get manufacturer
-            result = subprocess.run(['adb', '-s', device_id, 'shell', 'getprop', 'ro.product.manufacturer'], 
+            cmd = self._get_adb_command(['-s', device_id, 'shell', 'getprop', 'ro.product.manufacturer'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 info['manufacturer'] = result.stdout.strip()
             
             # Get Android version
-            result = subprocess.run(['adb', '-s', device_id, 'shell', 'getprop', 'ro.build.version.release'], 
+            cmd = self._get_adb_command(['-s', device_id, 'shell', 'getprop', 'ro.build.version.release'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 info['android_version'] = result.stdout.strip()
             
             # Get API level
-            result = subprocess.run(['adb', '-s', device_id, 'shell', 'getprop', 'ro.build.version.sdk'], 
+            cmd = self._get_adb_command(['-s', device_id, 'shell', 'getprop', 'ro.build.version.sdk'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 info['api_level'] = result.stdout.strip()
             
             # Get screen resolution
-            result = subprocess.run(['adb', '-s', device_id, 'shell', 'wm', 'size'], 
+            cmd = self._get_adb_command(['-s', device_id, 'shell', 'wm', 'size'])
+            result = subprocess.run(cmd, 
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and 'Physical size:' in result.stdout:
                 resolution = result.stdout.split('Physical size:')[1].strip()
                 info['resolution'] = resolution
             
-            # Determine device type
+            # Determine device type based on model and manufacturer
+            model = info.get('model', '').lower()
+            manufacturer = info.get('manufacturer', '').lower()
+            
             if '127.0.0.1:' in device_id:
-                if 'BlueStacks' in info.get('model', '') or 'bstk' in info.get('model', '').lower():
+                if 'bluestacks' in model or 'bstk' in model or 'bluestacks' in manufacturer:
                     info['type'] = 'BlueStacks'
+                elif 'ldplayer' in model or 'ld' in model or 'ldplayer' in manufacturer:
+                    info['type'] = 'LDPlayer'
+                elif 'mumu' in model or 'mumu' in manufacturer or 'netease' in manufacturer:
+                    info['type'] = 'MuMu Player'
+                elif 'nox' in model or 'nox' in manufacturer:
+                    info['type'] = 'Nox Player'
                 else:
                     info['type'] = 'Emulator'
             elif 'emulator-' in device_id:
@@ -194,7 +357,8 @@ class ADBManager:
                 connect_address = f"127.0.0.1:{port}"
                 logger.info(f"Attempting to connect to BlueStacks on {connect_address}")
                 
-                result = subprocess.run(['adb', 'connect', connect_address], 
+                cmd = self._get_adb_command(['connect', connect_address])
+                result = subprocess.run(cmd, 
                                       capture_output=True, text=True, timeout=15)
                 
                 if result.returncode == 0 and 'connected' in result.stdout.lower():
@@ -231,9 +395,74 @@ class ADBManager:
                 logger.error("No devices found. Make sure your emulator is running.")
                 raise DeviceNotFoundError("No devices found")
         else:
-            self.device_id = device_id
-            self.connected = True
-            return True
+            # For IP addresses (like 127.0.0.1:5555), we need to connect via ADB first
+            if ':' in device_id and not device_id.startswith('emulator-'):
+                try:
+                    logger.info(f"Connecting to device via ADB: {device_id}")
+                    cmd = self._get_adb_command(['connect', device_id])
+                    result = subprocess.run(cmd, 
+                                          capture_output=True, text=True, timeout=15)
+                    
+                    if result.returncode == 0 and 'connected' in result.stdout.lower():
+                        logger.info(f"Successfully connected to {device_id}")
+                    else:
+                        # Check if device is already connected
+                        connected_devices = self.get_connected_devices()
+                        if device_id not in connected_devices:
+                            logger.warning(f"Could not connect to {device_id}: {result.stderr or result.stdout}")
+                            # Still try to use it, might be connected already
+                except Exception as e:
+                    logger.warning(f"Error connecting to {device_id}: {e}")
+                    # Check if device is already connected anyway
+                    connected_devices = self.get_connected_devices()
+                    if device_id not in connected_devices:
+                        logger.warning(f"Device {device_id} not found in connected devices")
+            
+            # Verify device is actually available
+            connected_devices = self.get_connected_devices()
+            if device_id in connected_devices:
+                self.device_id = device_id
+                self.connected = True
+                logger.info(f"Device {device_id} is connected and ready")
+                return True
+            else:
+                logger.warning(f"Device {device_id} not found in connected devices list after connection attempt")
+                # Try to discover the correct port
+                discovered_device = self._discover_device_port()
+                if discovered_device:
+                    logger.info(f"Discovered device at {discovered_device}, using that instead")
+                    self.device_id = discovered_device
+                    self.connected = True
+                    return True
+                else:
+                    logger.error(f"Device {device_id} not available. Please ensure emulator is running and ADB is enabled.")
+                    # Don't mark as connected if we can't verify it
+                    self.device_id = None
+                    self.connected = False
+                    return False
+    
+    def _discover_device_port(self) -> Optional[str]:
+        """Discover available emulator device by scanning common ports"""
+        common_ports = [5555, 5554, 5556, 5558, 5562, 5564, 5566, 5568, 5570, 5572, 5574, 5576, 5578, 5580]
+        
+        logger.info("Scanning common ports to discover emulator...")
+        for port in common_ports:
+            device_id = f"127.0.0.1:{port}"
+            try:
+                cmd = self._get_adb_command(['connect', device_id])
+                result = subprocess.run(cmd, 
+                                      capture_output=True, text=True, timeout=5)
+                
+                if result.returncode == 0 and 'connected' in result.stdout.lower():
+                    # Verify it's actually connected
+                    connected_devices = self.get_connected_devices()
+                    if device_id in connected_devices:
+                        logger.info(f"Successfully discovered and connected to {device_id}")
+                        return device_id
+            except Exception:
+                continue
+        
+        return None
     
     def execute_adb_command(self, command: List[str]) -> Tuple[bool, str]:
         """Execute ADB command and return success status and output"""
@@ -242,7 +471,7 @@ class ADBManager:
             logger.error(f"ADBManager.execute_adb_command: {error_msg}")
             raise ADBError(error_msg)
         
-        full_command = ['adb', '-s', self.device_id] + command
+        full_command = self._get_adb_command(['-s', self.device_id] + command)
         logger.info(f"ADBManager executing: {' '.join(full_command)}")
         try:
             result = subprocess.run(full_command, capture_output=True, text=True, timeout=self.timeout)
@@ -342,7 +571,7 @@ class ADBManager:
             local_path = save_path or 'temp_screenshot.png'
             
             # Take screenshot and save to device
-            cmd1 = ['adb', '-s', self.device_id, 'shell', 'screencap', '-p', temp_path]
+            cmd1 = self._get_adb_command(['-s', self.device_id, 'shell', 'screencap', '-p', temp_path])
             result1 = subprocess.run(cmd1, capture_output=True, timeout=10)
             
             if result1.returncode != 0:
@@ -350,21 +579,85 @@ class ADBManager:
                 return None
             
             # Pull screenshot from device
-            cmd2 = ['adb', '-s', self.device_id, 'pull', temp_path, local_path]
+            cmd2 = self._get_adb_command(['-s', self.device_id, 'pull', temp_path, local_path])
             result2 = subprocess.run(cmd2, capture_output=True, timeout=10)
             
             if result2.returncode != 0:
                 logger.error("Failed to pull screenshot from device")
                 return None
             
-            # Load image with OpenCV
-            opencv_image = cv2.imread(local_path)
+            # Load image - try OpenCV first, fallback to PIL if OpenCV doesn't have imread
+            opencv_image = None
+            try:
+                if hasattr(cv2, 'imread'):
+                    # OpenCV imread loads as BGR by default, but PNG files might have alpha channel
+                    # Use IMREAD_UNCHANGED to check, then convert if needed
+                    if hasattr(cv2, 'IMREAD_UNCHANGED'):
+                        opencv_image = cv2.imread(local_path, cv2.IMREAD_UNCHANGED)
+                    else:
+                        opencv_image = cv2.imread(local_path)
+                    
+                    # If image has 4 channels (RGBA), convert to BGR (3 channels)
+                    if opencv_image is not None and len(opencv_image.shape) == 3 and opencv_image.shape[2] == 4:
+                        logger.debug(f"Image loaded with 4 channels (RGBA), converting to BGR...")
+                        # Convert RGBA to BGR (drop alpha channel)
+                        if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_RGBA2BGR'):
+                            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_RGBA2BGR)
+                        elif hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGRA2BGR'):
+                            # If OpenCV loaded as BGRA, convert BGRA to BGR
+                            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGRA2BGR)
+                        else:
+                            # Manual conversion: drop alpha channel and keep BGR
+                            opencv_image = opencv_image[:, :, :3]  # Take only first 3 channels (BGR)
+                        logger.debug(f"Converted RGBA to BGR: shape={opencv_image.shape}")
+                else:
+                    # Fallback: Use PIL to load image and convert to OpenCV format
+                    pil_image = Image.open(local_path)
+                    # Convert PIL image to numpy array (OpenCV format: BGR)
+                    opencv_image = np.array(pil_image)
+                    
+                    if len(opencv_image.shape) == 3:
+                        # Handle RGBA (4 channels) or RGB (3 channels)
+                        if opencv_image.shape[2] == 4:
+                            # RGBA image - convert to RGB first by removing alpha channel
+                            # Or blend alpha channel (preferred for transparency)
+                            # For screenshots, we can just drop alpha channel
+                            logger.debug(f"Image has 4 channels (RGBA), converting to RGB...")
+                            # Option 1: Drop alpha channel (simple)
+                            opencv_image = opencv_image[:, :, :3]  # Take only RGB channels
+                            # Option 2: Blend alpha if needed (commented out for now)
+                            # alpha = opencv_image[:, :, 3:4] / 255.0
+                            # rgb = opencv_image[:, :, :3]
+                            # opencv_image = (rgb * alpha + 255 * (1 - alpha)).astype(np.uint8)
+                        
+                        # Convert RGB to BGR for OpenCV compatibility
+                        # Use numpy operations instead of cv2.cvtColor if cv2 doesn't have it
+                        if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_RGB2BGR'):
+                            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_RGB2BGR)
+                        else:
+                            # Manual RGB to BGR conversion using numpy
+                            opencv_image = opencv_image[:, :, ::-1]  # Reverse RGB channels to BGR
+                    
+                    logger.debug(f"Loaded image using PIL fallback: shape={opencv_image.shape}, dtype={opencv_image.dtype}")
+            except Exception as e:
+                logger.error(f"Error loading image: {e}")
+                opencv_image = None
+            
+            if opencv_image is None:
+                logger.error("Failed to load screenshot image")
+                # Clean up temp files
+                cmd3 = self._get_adb_command(['-s', self.device_id, 'shell', 'rm', temp_path])
+                subprocess.run(cmd3, 
+                             capture_output=True, timeout=5)
+                if not save_path and os.path.exists(local_path):
+                    os.remove(local_path)
+                return None
             
             # Clean up temp files immediately
-            subprocess.run(['adb', '-s', self.device_id, 'shell', 'rm', temp_path], 
+            cmd3 = self._get_adb_command(['-s', self.device_id, 'shell', 'rm', temp_path])
+            subprocess.run(cmd3, 
                          capture_output=True, timeout=5)
             
-            import os
             if not save_path and os.path.exists(local_path):
                 os.remove(local_path)
             
@@ -392,7 +685,8 @@ class ADBManager:
         """Disconnect from current device"""
         if self.device_id and '127.0.0.1:' in self.device_id:
             try:
-                result = subprocess.run(['adb', 'disconnect', self.device_id], 
+                cmd = self._get_adb_command(['disconnect', self.device_id])
+                result = subprocess.run(cmd, 
                                       capture_output=True, text=True, timeout=10)
                 if result.returncode == 0:
                     logger.info(f"Disconnected from {self.device_id}")
@@ -590,7 +884,8 @@ class ADBManager:
         try:
             # Try to connect to the device
             if '127.0.0.1:' in device_id:
-                result = subprocess.run(['adb', 'connect', device_id], 
+                cmd = self._get_adb_command(['connect', device_id])
+                result = subprocess.run(cmd, 
                                       capture_output=True, text=True, timeout=15)
                 
                 if result.returncode != 0 or 'connected' not in result.stdout.lower():
@@ -631,7 +926,8 @@ class ADBManager:
                     logger.debug(f"Attempting to connect to {device_id}")
                     
                     if '127.0.0.1:' in device_id:
-                        result = subprocess.run(['adb', 'connect', device_id], 
+                        cmd = self._get_adb_command(['connect', device_id])
+                        result = subprocess.run(cmd, 
                                               capture_output=True, text=True, timeout=10)
                         
                         if result.returncode != 0:

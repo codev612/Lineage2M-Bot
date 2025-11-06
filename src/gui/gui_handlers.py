@@ -66,9 +66,10 @@ class GUIEventHandlers:
                     connected_count = 0
                     for device in game_ready_devices[:devices_to_connect]:  # Only try to connect up to available slots
                         try:
-                            if self.multi_device_manager.connect_device(device['id'], device):
+                            actual_device_id = self.multi_device_manager.connect_device(device['id'], device)
+                            if actual_device_id:
                                 connected_count += 1
-                                logger.info(f"Auto-connected to game-ready device: {device['id']}")
+                                logger.info(f"Auto-connected to game-ready device: {actual_device_id}")
                         except Exception as e:
                             logger.error(f"Failed to auto-connect to {device['id']}: {e}")
                     
@@ -114,7 +115,51 @@ class GUIEventHandlers:
         self._discover_devices()
     
     def _restore_saved_devices(self):
-        """Restore saved devices on startup"""
+        """Restore saved devices on startup - gracefully handles connection failures"""
+        # First, load and show saved devices immediately (before connection attempts)
+        try:
+            saved_devices = device_persistence.load_devices()
+            
+            if saved_devices:
+                logger.info(f"Loading {len(saved_devices)} saved device(s) to display...")
+                # Initialize devices_list if needed
+                if not hasattr(self, 'devices_list') or self.devices_list is None:
+                    self.devices_list = []
+                
+                # Add all saved devices immediately with "connecting" status
+                for device_id in saved_devices:
+                    existing_ids = [d['id'] for d in self.devices_list]
+                    if device_id not in existing_ids:
+                        pending_device_info = {
+                            'id': device_id,
+                            'type': 'Emulator' if ':' in device_id else 'Unknown',
+                            'model': 'Unknown',
+                            'android_version': 'Unknown',
+                            'resolution': 'Unknown',
+                            'status': 'pending',
+                            'connection_error': None,
+                            'game_status': {
+                                'installed': False,
+                                'running': False,
+                                'installed_packages': [],
+                                'running_packages': [],
+                                'foreground_package': None
+                            },
+                            'is_saved_device': True
+                        }
+                        self.devices_list.append(pending_device_info)
+                
+                # Update GUI immediately to show saved devices
+                if self.devices_list:
+                    self.message_queue.put({
+                        'type': 'update_device_list',
+                        'devices': self.devices_list
+                    })
+                    logger.info(f"Showing {len(saved_devices)} saved device(s) in GUI")
+        except Exception as e:
+            logger.error(f"Error loading saved devices for display: {e}", exc_info=True)
+        
+        # Now try to connect in background thread
         def restore_thread():
             try:
                 saved_devices = device_persistence.load_devices()
@@ -123,10 +168,12 @@ class GUIEventHandlers:
                     logger.info("No saved devices to restore")
                     return
                 
-                logger.info(f"Restoring {len(saved_devices)} saved device(s)...")
-                self._update_status(f"🔄 Restoring {len(saved_devices)} saved device(s)...")
+                logger.info(f"Attempting to connect to {len(saved_devices)} saved device(s)...")
+                self._update_status(f"🔄 Connecting to {len(saved_devices)} saved device(s)...")
                 
                 restored_count = 0
+                failed_devices = []
+                
                 for device_id in saved_devices:
                     try:
                         # Try to connect via ADB if it's an IP address
@@ -138,12 +185,40 @@ class GUIEventHandlers:
                                     text=True,
                                     timeout=5
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"ADB connect attempt failed for {device_id}: {e}")
                         
                         # Ensure ADB is connected to this device
-                        if not self.device_manager.adb.connect_to_device(device_id):
-                            logger.warning(f"Could not connect to saved device: {device_id}")
+                        connection_error = None
+                        try:
+                            if not self.device_manager.adb.connect_to_device(device_id):
+                                connection_error = "Device offline or using different port"
+                                logger.warning(f"Could not connect to saved device: {device_id} - {connection_error}")
+                                failed_devices.append((device_id, connection_error))
+                                # Update existing device in list with error status
+                                if hasattr(self, 'devices_list') and self.devices_list:
+                                    for device in self.devices_list:
+                                        if device['id'] == device_id:
+                                            device['status'] = 'disconnected'
+                                            device['connection_error'] = connection_error
+                                            break
+                                # Update connection state to false
+                                try:
+                                    device_state_monitor.update_connection_state(device_id, False)
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception as e:
+                            connection_error = f"Connection error: {str(e)}"
+                            logger.error(f"Exception while connecting to {device_id}: {e}", exc_info=True)
+                            failed_devices.append((device_id, connection_error))
+                            # Update existing device in list with error status
+                            if hasattr(self, 'devices_list') and self.devices_list:
+                                for device in self.devices_list:
+                                    if device['id'] == device_id:
+                                        device['status'] = 'disconnected'
+                                        device['connection_error'] = connection_error
+                                        break
                             continue
                         
                         # Get device information
@@ -189,65 +264,140 @@ class GUIEventHandlers:
                             device_info['game_active'] = False
                         
                         # Connect to device using multi-device manager
-                        if self.multi_device_manager.connect_device(device_id, device_info):
+                        actual_device_id = self.multi_device_manager.connect_device(device_id, device_info)
+                        if actual_device_id:
                             restored_count += 1
-                            logger.info(f"Restored device: {device_id}")
+                            # Device may have been discovered at a different port
+                            if actual_device_id != device_id:
+                                logger.info(f"Device port changed during restore: {device_id} -> {actual_device_id}")
+                                # Update device_info with the actual device_id
+                                device_info['id'] = actual_device_id
+                                # Update saved device list to use the discovered port
+                                try:
+                                    device_persistence.remove_device(device_id)
+                                    device_persistence.save_device(actual_device_id)
+                                    logger.info(f"Updated saved device from {device_id} to {actual_device_id}")
+                                except Exception as e:
+                                    logger.warning(f"Could not update saved device list: {e}")
                             
-                            # Register device with state monitor
-                            device_state_monitor.register_device(device_id)
-                            device_state_monitor.update_connection_state(device_id, True)
+                            logger.info(f"Restored device: {actual_device_id}")
+                            
+                            # Register device with state monitor (use actual_device_id)
+                            device_state_monitor.register_device(actual_device_id)
+                            device_state_monitor.update_connection_state(actual_device_id, True)
                             
                             # Update game state in monitor if game is running
                             if device_info.get('game_status', {}).get('running'):
                                 running_package = device_info['game_status'].get('foreground_package') or \
                                                  device_info['game_status'].get('running_packages', [None])[0]
                                 device_state_monitor.update_game_state(
-                                    device_id,
+                                    actual_device_id,
                                     is_running=True,
                                     package_name=running_package,
                                     game_state='detected'
                                 )
-                                logger.info(f"Updated game state for restored {device_id}: running={True}, package={running_package}")
+                                logger.info(f"Updated game state for restored {actual_device_id}: running={True}, package={running_package}")
                             else:
-                                device_state_monitor.update_game_state(device_id, is_running=False)
-                                logger.info(f"Updated game state for restored {device_id}: running=False")
+                                device_state_monitor.update_game_state(actual_device_id, is_running=False)
+                                logger.info(f"Updated game state for restored {actual_device_id}: running=False")
                             
-                            # Add device to list
-                            if not hasattr(self, 'devices_list') or self.devices_list is None:
-                                self.devices_list = []
-                            
-                            existing_ids = [d['id'] for d in self.devices_list]
-                            if device_id not in existing_ids:
+                            # Update existing device in list with connected info
+                            if hasattr(self, 'devices_list') and self.devices_list:
+                                # Remove old device_id if it changed
+                                if actual_device_id != device_id:
+                                    self.devices_list = [d for d in self.devices_list if d['id'] != device_id]
+                                
+                                # Update or add device with actual_device_id
+                                found = False
+                                for i, device in enumerate(self.devices_list):
+                                    if device['id'] == actual_device_id:
+                                        # Update with connected device info
+                                        self.devices_list[i] = device_info
+                                        found = True
+                                        break
+                                if not found:
+                                    self.devices_list.append(device_info)
+                            else:
+                                # Fallback: add to list if not found
+                                if not hasattr(self, 'devices_list') or self.devices_list is None:
+                                    self.devices_list = []
                                 self.devices_list.append(device_info)
                         else:
                             logger.warning(f"Failed to connect to saved device: {device_id}")
                             device_state_monitor.update_connection_state(device_id, False)
                             
                     except Exception as e:
+                        connection_error = f"Error: {str(e)}"
                         logger.error(f"Error restoring device {device_id}: {e}", exc_info=True)
+                        failed_devices.append((device_id, connection_error))
+                        # Update existing device in list with error status
+                        if hasattr(self, 'devices_list') and self.devices_list:
+                            for device in self.devices_list:
+                                if device['id'] == device_id:
+                                    device['status'] = 'disconnected'
+                                    device['connection_error'] = connection_error
+                                    break
+                        # Ensure connection state is marked as false
+                        try:
+                            device_state_monitor.update_connection_state(device_id, False)
+                        except Exception:
+                            pass
                         continue
                 
                 # Update GUI with restored devices
-                if restored_count > 0:
-                    device_status = self.multi_device_manager.get_device_status()
-                    self.message_queue.put({
-                        'type': 'devices_restored',
-                        'devices': self.devices_list,
-                        'restored_count': restored_count,
-                        'device_status': device_status
-                    })
-                else:
-                    self.message_queue.put({
-                        'type': 'devices_restore_failed',
-                        'message': 'Could not restore any saved devices'
-                    })
+                try:
+                    if restored_count > 0:
+                        device_status = self.multi_device_manager.get_device_status()
+                        self.message_queue.put({
+                            'type': 'devices_restored',
+                            'devices': self.devices_list,
+                            'restored_count': restored_count,
+                            'device_status': device_status
+                        })
+                    else:
+                        # No devices restored, but don't break the GUI
+                        logger.info("No devices were successfully restored, but GUI will continue to work")
+                        self.message_queue.put({
+                            'type': 'devices_restore_failed',
+                            'message': 'Could not restore any saved devices'
+                        })
+                    
+                    # Update GUI with all devices (including failed ones) after connection attempts
+                    if self.devices_list:
+                        self.message_queue.put({
+                            'type': 'update_device_list',
+                            'devices': self.devices_list
+                        })
+                        logger.info(f"Updated GUI with {len(self.devices_list)} device(s) (connected: {restored_count}, failed: {len(failed_devices)})")
+                    
+                    # Log summary
+                    if failed_devices:
+                        failed_list = [f"{dev_id} ({error})" for dev_id, error in failed_devices]
+                        logger.warning(f"Failed to restore {len(failed_devices)} device(s): {failed_list}")
+                        logger.info("💡 Tip: Failed devices are shown in the device list with error messages")
+                    
+                    if restored_count > 0:
+                        self._update_status(f"✅ Restored {restored_count} device(s)" + (f", {len(failed_devices)} failed" if failed_devices else ""))
+                    elif failed_devices:
+                        self._update_status(f"⚠️ Could not connect to {len(failed_devices)} saved device(s) - shown in device list")
+                    else:
+                        self._update_status("⚠️ No saved devices to restore")
+                        
+                except Exception as e:
+                    logger.error(f"Error updating GUI with restored devices: {e}", exc_info=True)
+                    # Even if GUI update fails, don't break - just log the error
                     
             except Exception as e:
                 logger.error(f"Error restoring saved devices: {e}", exc_info=True)
-                self.message_queue.put({
-                    'type': 'error',
-                    'message': f"Error restoring saved devices: {e}"
-                })
+                # Don't break the GUI - just log the error and continue
+                try:
+                    self.message_queue.put({
+                        'type': 'error',
+                        'message': f"Error restoring saved devices: {e}"
+                    })
+                except Exception:
+                    pass  # If even message queue fails, just continue
+                logger.info("GUI will continue to work - you can manually discover devices")
         
         # Run in separate thread to avoid blocking GUI startup
         threading.Thread(target=restore_thread, daemon=True).start()
@@ -344,44 +494,54 @@ class GUIEventHandlers:
                     device_info['game_active'] = False
                 
                 # Connect to device using multi-device manager
-                if self.multi_device_manager.connect_device(device_id, device_info):
-                    logger.info(f"Successfully connected to manually added device: {device_id}")
+                actual_device_id = self.multi_device_manager.connect_device(device_id, device_info)
+                if actual_device_id:
+                    # Device may have been discovered at a different port
+                    if actual_device_id != device_id:
+                        logger.info(f"Device port changed during connection: {device_id} -> {actual_device_id}")
+                        device_info['id'] = actual_device_id
                     
-                    # Register device with state monitor
-                    device_state_monitor.register_device(device_id)
-                    device_state_monitor.update_connection_state(device_id, True)
+                    logger.info(f"Successfully connected to manually added device: {actual_device_id}")
+                    
+                    # Register device with state monitor (use actual_device_id)
+                    device_state_monitor.register_device(actual_device_id)
+                    device_state_monitor.update_connection_state(actual_device_id, True)
                     
                     # Update game state in monitor if game is running
                     if device_info.get('game_status', {}).get('running'):
                         running_package = device_info['game_status'].get('foreground_package') or \
                                          device_info['game_status'].get('running_packages', [None])[0]
                         device_state_monitor.update_game_state(
-                            device_id,
+                            actual_device_id,
                             is_running=True,
                             package_name=running_package,
                             game_state='detected'
                         )
-                        logger.info(f"Updated game state for {device_id}: running={True}, package={running_package}")
+                        logger.info(f"Updated game state for {actual_device_id}: running={True}, package={running_package}")
                     else:
-                        device_state_monitor.update_game_state(device_id, is_running=False)
-                        logger.info(f"Updated game state for {device_id}: running=False")
+                        device_state_monitor.update_game_state(actual_device_id, is_running=False)
+                        logger.info(f"Updated game state for {actual_device_id}: running=False")
                     
-                    # Save device to persistent storage
-                    device_persistence.save_device(device_id)
+                    # Save device to persistent storage (use actual_device_id)
+                    device_persistence.save_device(actual_device_id)
                     
                     # Add device to existing list without doing full discovery
                     if not hasattr(self, 'devices_list') or self.devices_list is None:
                         self.devices_list = []
                     
-                    # Check if device already in list
+                    # Remove old device_id from list if port changed
+                    if actual_device_id != device_id:
+                        self.devices_list = [d for d in self.devices_list if d['id'] != device_id]
+                    
+                    # Check if device already in list (use actual_device_id)
                     existing_ids = [d['id'] for d in self.devices_list]
-                    if device_id not in existing_ids:
+                    if actual_device_id not in existing_ids:
                         self.devices_list.append(device_info)
                     
                     device_status = self.multi_device_manager.get_device_status()
                     self.message_queue.put({
                         'type': 'device_added_manually',
-                        'device_id': device_id,
+                        'device_id': actual_device_id,  # Use actual device_id
                         'devices': self.devices_list,
                         'device_status': device_status
                     })
@@ -797,9 +957,10 @@ class GUIEventHandlers:
                 self.root.after(0, lambda: self._actually_start_device_bot(device_id))
                 
             except Exception as e:
-                logger.error(f"Error checking game state for {device_id}: {e}", exc_info=True)
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Error starting bot: {e}"))
-                self.root.after(0, lambda: self._update_status(f"❌ Error starting bot: {e}"))
+                error_msg = str(e)
+                logger.error(f"Error checking game state for {device_id}: {error_msg}", exc_info=True)
+                self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", f"Error starting bot: {msg}"))
+                self.root.after(0, lambda msg=error_msg: self._update_status(f"❌ Error starting bot: {msg}"))
         
         # Run check in background thread
         threading.Thread(target=check_and_start, daemon=True).start()
@@ -2201,6 +2362,13 @@ For support and documentation, visit the project repository."""
             # Refresh per-device control widgets
             self._refresh_device_control_widgets()
             
+        elif msg_type == 'update_device_list':
+            # Update device list (including failed saved devices)
+            devices = message.get('devices', [])
+            if devices:
+                self._update_device_list(devices)
+                self._update_button_states()
+        
         elif msg_type == 'devices_restore_failed':
             message_text = message.get('message', 'Could not restore saved devices')
             self._update_status(f"⚠️ {message_text}")
@@ -2327,7 +2495,7 @@ For support and documentation, visit the project repository."""
         
         # Check if this device already exists in the tree (prevent duplicates)
         for item in self.device_tree.get_children():
-            existing_device_id = self.device_tree.item(item, "text").replace(" ⭐", "")
+            existing_device_id = self.device_tree.item(item, "text").replace(" ⭐", "").replace(" 💾", "")
             if existing_device_id == device_id:
                 logger.warning(f"Device {device_id} already exists in tree, skipping duplicate")
                 return
@@ -2335,9 +2503,23 @@ For support and documentation, visit the project repository."""
         # Check if device is connected in multi-device manager
         connected_devices = self.multi_device_manager.get_connected_devices()
         is_connected_multi = device_id in connected_devices
-        connection_status = "🟢 Connected" if is_connected_multi else "🔴 Disconnected"
+        
+        # Check for connection error message (for saved devices that failed to connect)
+        connection_error = device.get('connection_error')
+        device_status_value = device.get('status', 'unknown')
+        
+        if connection_error:
+            connection_status = f"🔴 {connection_error}"
+        elif device_status_value == 'pending':
+            connection_status = "🟡 Connecting..."
+        elif is_connected_multi:
+            connection_status = "🟢 Connected"
+        else:
+            connection_status = "🔴 Disconnected"
         
         # Determine device status and icon
+        device_status_value = device.get('status', 'unknown')
+        
         if is_game_device:
             # Game devices are automatically marked as "available" for bot use
             if game_status.get('running'):
@@ -2347,12 +2529,26 @@ For support and documentation, visit the project repository."""
                 status_icon = "📱"  
                 device_status = "available"
             else:
-                status_icon = "🟢" if device['status'] == 'connected' else "🟡"
-                device_status = "available" if device['status'] in ['connected', 'available'] else "unavailable"
+                if device_status_value == 'pending':
+                    status_icon = "🟡"
+                    device_status = "connecting"
+                elif device_status_value == 'connected':
+                    status_icon = "🟢"
+                    device_status = "available"
+                else:
+                    status_icon = "🔴"
+                    device_status = "unavailable"
         else:
             # Regular devices - show available/unavailable based on connection status
-            status_icon = "🟢" if device['status'] == 'connected' else "🟡"
-            device_status = "available" if device['status'] in ['connected', 'available'] else "unavailable"
+            if device_status_value == 'pending':
+                status_icon = "🟡"
+                device_status = "connecting"
+            elif device_status_value == 'connected':
+                status_icon = "🟢"
+                device_status = "available"
+            else:
+                status_icon = "🔴"
+                device_status = "unavailable"
         
         # Game status information
         game_info = "Not installed"
@@ -2364,9 +2560,12 @@ For support and documentation, visit the project repository."""
             game_info = f"📱 Installed ({installed_count})"
         
         # Add priority indicator for game devices
+        # Add saved device indicator if it's a saved device that failed to connect
         display_device_id = device_id
         if is_game_device:
             display_device_id += " ⭐"
+        if device.get('is_saved_device') and not is_connected_multi:
+            display_device_id += " 💾"  # Indicate this is a saved device
         
         # Default checkbox state
         checkbox_state = "☐"

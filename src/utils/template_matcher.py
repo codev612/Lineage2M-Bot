@@ -12,6 +12,59 @@ import os
 from ..utils.logger import get_logger
 from ..utils.config import config_manager
 
+def _bgr_to_gray_cv2(image: np.ndarray) -> np.ndarray:
+    """Convert BGR image to grayscale - fallback if cv2.cvtColor doesn't exist"""
+    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGR2GRAY'):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        # Manual BGR to grayscale conversion using standard formula
+        # gray = 0.114*B + 0.587*G + 0.299*R
+        if len(image.shape) == 3:
+            b, g, r = image[:, :, 0], image[:, :, 1], image[:, :, 2]
+            gray = (0.114 * b.astype(np.float32) + 
+                    0.587 * g.astype(np.float32) + 
+                    0.299 * r.astype(np.float32)).astype(np.uint8)
+            return gray
+        else:
+            return image
+
+def _resize_cv2(image: np.ndarray, size: Tuple[int, int], interpolation: int = None) -> np.ndarray:
+    """Resize image - fallback if cv2.resize doesn't exist"""
+    if hasattr(cv2, 'resize'):
+        # Map interpolation constants if needed
+        if interpolation is None:
+            interpolation = cv2.INTER_CUBIC if hasattr(cv2, 'INTER_CUBIC') else 3
+        elif not isinstance(interpolation, int):
+            # If it's an attribute, try to get its value
+            if hasattr(cv2, str(interpolation).split('.')[-1]):
+                interp_name = str(interpolation).split('.')[-1]
+                interpolation = getattr(cv2, interp_name, 3)
+            else:
+                interpolation = 3  # Default to cubic
+        return cv2.resize(image, size, interpolation=interpolation)
+    else:
+        # Fallback: Use PIL to resize
+        from PIL import Image
+        # Convert numpy array to PIL Image
+        if len(image.shape) == 3:
+            # BGR to RGB for PIL
+            pil_image = Image.fromarray(image[:, :, ::-1])
+        else:
+            # Grayscale
+            pil_image = Image.fromarray(image)
+        
+        # Resize using PIL (LANCZOS is similar to INTER_CUBIC)
+        resized_pil = pil_image.resize(size, Image.LANCZOS)
+        
+        # Convert back to numpy array
+        resized = np.array(resized_pil)
+        
+        # Convert RGB back to BGR if needed
+        if len(resized.shape) == 3:
+            resized = resized[:, :, ::-1]
+        
+        return resized
+
 # Try to import Tesseract OCR (optional)
 try:
     import pytesseract
@@ -26,6 +79,8 @@ class TemplateMatcher:
     """
     Template matching utility for finding game UI elements in screenshots
     """
+    # Class-level flag to track if OpenCV warning has been logged (only log once globally)
+    _opencv_warning_logged_class = False
     
     def __init__(self, templates_dir: str = "assets/templates"):
         """
@@ -39,8 +94,28 @@ class TemplateMatcher:
         self.confidence_threshold = self.config.image_recognition.confidence_threshold
         
         # Parse template matching method from config
+        # OpenCV template matching constants (as integers if not available as attributes)
+        TM_CONSTANTS = {
+            'TM_SQDIFF': 0,
+            'TM_SQDIFF_NORMED': 1,
+            'TM_CCORR': 2,
+            'TM_CCORR_NORMED': 3,
+            'TM_CCOEFF': 4,
+            'TM_CCOEFF_NORMED': 5
+        }
+        
         method_str = self.config.image_recognition.template_matching_method
-        self.matching_method = getattr(cv2, method_str.split('.')[-1], cv2.TM_CCOEFF_NORMED)
+        method_name = method_str.split('.')[-1]
+        
+        # Try to get from cv2 attributes first, fallback to integer constants
+        if hasattr(cv2, method_name):
+            self.matching_method = getattr(cv2, method_name)
+        elif method_name in TM_CONSTANTS:
+            self.matching_method = TM_CONSTANTS[method_name]
+        else:
+            # Default to TM_CCOEFF_NORMED (value 5)
+            self.matching_method = TM_CONSTANTS.get('TM_CCOEFF_NORMED', 5)
+            logger.warning(f"Unknown template matching method: {method_name}, using TM_CCOEFF_NORMED")
         
         # Cache for loaded templates
         self.template_cache: Dict[str, np.ndarray] = {}
@@ -51,6 +126,28 @@ class TemplateMatcher:
         
         # OCR reader (lazy initialization - using Tesseract instead of EasyOCR)
         self._ocr_reader = None
+        
+        # Track if we've already warned about missing OpenCV functions (to avoid spam)
+        self._opencv_warning_logged = False
+        
+        # Check if OpenCV has required functions
+        self._opencv_available = (
+            hasattr(cv2, 'matchTemplate') and 
+            hasattr(cv2, 'minMaxLoc') and 
+            hasattr(cv2, 'resize') and
+            hasattr(cv2, 'imread')
+        )
+        
+        # Only log warning once globally (class-level check)
+        if not self._opencv_available and not TemplateMatcher._opencv_warning_logged_class:
+            logger.error(
+                "WARNING: OpenCV installation appears corrupted - template matching will not work!\n"
+                "Required functions missing: matchTemplate, minMaxLoc, resize, or imread\n"
+                "Please reinstall OpenCV with:\n"
+                "  pip uninstall opencv-python opencv-python-headless -y\n"
+                "  pip install --force-reinstall --no-cache-dir opencv-python"
+            )
+            TemplateMatcher._opencv_warning_logged_class = True
         
         # Ensure templates directory exists
         self.templates_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +178,21 @@ class TemplateMatcher:
             return None
         
         try:
-            template = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+            # Load template - try OpenCV first, fallback to PIL
+            if hasattr(cv2, 'imread'):
+                template = cv2.imread(str(template_path), cv2.IMREAD_COLOR if hasattr(cv2, 'IMREAD_COLOR') else None)
+            else:
+                # Fallback: Use PIL to load image and convert to OpenCV format
+                from PIL import Image
+                pil_image = Image.open(template_path)
+                template = np.array(pil_image)
+                if len(template.shape) == 3:
+                    # Convert RGB to BGR for OpenCV compatibility
+                    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_RGB2BGR'):
+                        template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
+                    else:
+                        # Manual RGB to BGR conversion using numpy
+                        template = template[:, :, ::-1]  # Reverse RGB channels to BGR
             if template is None:
                 logger.error(f"Failed to load template: {template_path}")
                 return None
@@ -144,29 +255,211 @@ class TemplateMatcher:
             logger.error(f"Error matching template {template_name}: {e}")
             return None
     
+    def find_template_best_match(self,
+                                 screenshot: np.ndarray,
+                                 template_name: str,
+                                 region: Tuple[int, int, int, int] = None,
+                                 multi_scale: bool = True) -> Optional[Tuple[int, int, float]]:
+        """
+        Find the best template match regardless of threshold (for debugging)
+        
+        Args:
+            screenshot: Screenshot image to search in
+            template_name: Name of the template to find
+            region: Optional region to search in (x, y, width, height)
+            multi_scale: Whether to use multi-scale matching
+            
+        Returns:
+            Tuple of (center_x, center_y, confidence) of best match found, or None
+        """
+        # Load template
+        template = self.load_template(template_name)
+        if template is None:
+            return None
+        
+        # Extract region if specified
+        if region:
+            x, y, w, h = region
+            search_area = screenshot[y:y+h, x:x+w]
+            if search_area.size == 0:
+                logger.warning(f"Invalid search region: {region}")
+                return None
+        else:
+            search_area = screenshot
+        
+        try:
+            if multi_scale:
+                # Use multi-scale matching but return best match regardless of threshold
+                return self._find_template_multiscale_best(search_area, template, region)
+            else:
+                # Use single-scale matching but return best match regardless of threshold
+                return self._find_template_singlescale_best(search_area, template, region, template_name)
+        except Exception as e:
+            logger.error(f"Error finding best match for template {template_name}: {e}")
+            return None
+    
+    def _find_template_singlescale_best(self, search_area: np.ndarray, template: np.ndarray,
+                                       region: Tuple[int, int, int, int], template_name: str) -> Optional[Tuple[int, int, float]]:
+        """Single-scale template matching - returns best match regardless of threshold"""
+        # Convert to grayscale for matching
+        if len(search_area.shape) == 3:
+            search_gray = _bgr_to_gray_cv2(search_area)
+        else:
+            search_gray = search_area
+        
+        if len(template.shape) == 3:
+            template_gray = _bgr_to_gray_cv2(template)
+        else:
+            template_gray = template
+        
+        # Perform template matching
+        if not self._opencv_available or not hasattr(cv2, 'matchTemplate'):
+            return None
+        
+        try:
+            result = cv2.matchTemplate(search_gray, template_gray, self.matching_method)
+        except Exception as e:
+            logger.error(f"Error in template matching: {e}")
+            return None
+        
+        # Get the best match
+        try:
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        except Exception as e:
+            logger.error(f"Error in minMaxLoc: {e}")
+            return None
+        
+        # For TM_CCOEFF_NORMED, higher is better
+        if self.matching_method in [0, 1]:  # TM_SQDIFF, TM_SQDIFF_NORMED
+            confidence_score = 1 - min_val
+            match_loc = min_loc
+        else:
+            confidence_score = max_val
+            match_loc = max_loc
+        
+        # Calculate center position (always return best match regardless of threshold)
+        template_h, template_w = template.shape[:2]
+        
+        if region:
+            center_x = region[0] + match_loc[0] + template_w // 2
+            center_y = region[1] + match_loc[1] + template_h // 2
+        else:
+            center_x = match_loc[0] + template_w // 2
+            center_y = match_loc[1] + template_h // 2
+        
+        logger.info(f"Best match for {template_name}: location=({match_loc[0]}, {match_loc[1]}), center=({center_x}, {center_y}), confidence={confidence_score:.3f}")
+        return (center_x, center_y, confidence_score)
+    
+    def _find_template_multiscale_best(self, search_area: np.ndarray, template: np.ndarray,
+                                      region: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, float]]:
+        """Multi-scale template matching - returns best match regardless of threshold"""
+        # Convert to grayscale
+        if len(search_area.shape) == 3:
+            search_gray = _bgr_to_gray_cv2(search_area)
+        else:
+            search_gray = search_area
+            
+        if len(template.shape) == 3:
+            template_gray = _bgr_to_gray_cv2(template)
+        else:
+            template_gray = template
+        
+        best_val = -1
+        best_loc = None
+        best_size = None
+        best_scale = None
+        
+        # Check if OpenCV is available
+        if not self._opencv_available or not hasattr(cv2, 'matchTemplate') or not hasattr(cv2, 'minMaxLoc'):
+            return None
+        
+        logger.debug(f"Multi-scale matching (best match): trying {len(self.scales)} scales")
+        
+        for scale in self.scales:
+            # Resize template
+            new_size = (int(template_gray.shape[1] * scale), int(template_gray.shape[0] * scale))
+            interpolation = cv2.INTER_CUBIC if hasattr(cv2, 'INTER_CUBIC') else 3
+            resized = _resize_cv2(template_gray, new_size, interpolation=interpolation)
+            
+            # Skip if resized template is larger than search area
+            if resized.shape[0] > search_gray.shape[0] or resized.shape[1] > search_gray.shape[1]:
+                continue
+            
+            # Match template
+            try:
+                res = cv2.matchTemplate(search_gray, resized, self.matching_method)
+            except Exception as e:
+                logger.error(f"Error in template matching at scale {scale}: {e}")
+                continue
+            
+            try:
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            except Exception as e:
+                logger.error(f"Error in minMaxLoc at scale {scale}: {e}")
+                continue
+            
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_size = resized.shape[::-1]  # (width, height)
+                best_scale = scale
+        
+        # Return best match regardless of threshold
+        if best_loc is None:
+            logger.warning("No match found at any scale")
+            return None
+        
+        # Calculate center position
+        w, h = best_size
+        
+        if region:
+            center_x = region[0] + best_loc[0] + w // 2
+            center_y = region[1] + best_loc[1] + h // 2
+        else:
+            center_x = best_loc[0] + w // 2
+            center_y = best_loc[1] + h // 2
+        
+        logger.info(f"Best multi-scale match: location=({best_loc[0]}, {best_loc[1]}), center=({center_x}, {center_y}), confidence={best_val:.3f}, scale={best_scale:.2f}")
+        return (center_x, center_y, best_val)
+    
     def _find_template_singlescale(self, search_area: np.ndarray, template: np.ndarray,
                                    threshold: float, region: Tuple[int, int, int, int],
                                    template_name: str) -> Optional[Tuple[int, int, float]]:
         """Single-scale template matching"""
         # Convert to grayscale for matching
         if len(search_area.shape) == 3:
-            search_gray = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+            search_gray = _bgr_to_gray_cv2(search_area)
         else:
             search_gray = search_area
-            
+        
         if len(template.shape) == 3:
-            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            template_gray = _bgr_to_gray_cv2(template)
         else:
             template_gray = template
         
         # Perform template matching
-        result = cv2.matchTemplate(search_gray, template_gray, self.matching_method)
+        if not self._opencv_available or not hasattr(cv2, 'matchTemplate'):
+            if not self._opencv_warning_logged:
+                logger.debug("Skipping template matching - OpenCV functions not available (already warned at initialization)")
+                self._opencv_warning_logged = True
+            return None
+        
+        try:
+            result = cv2.matchTemplate(search_gray, template_gray, self.matching_method)
+        except Exception as e:
+            logger.error(f"Error in template matching: {e}")
+            return None
         
         # Get the best match
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        try:
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        except Exception as e:
+            logger.error(f"Error in minMaxLoc: {e}")
+            return None
         
         # For TM_CCOEFF_NORMED, higher is better
-        if self.matching_method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
+        # Use integer values for comparison (TM_SQDIFF=0, TM_SQDIFF_NORMED=1, TM_CCOEFF_NORMED=5)
+        if self.matching_method in [0, 1]:  # TM_SQDIFF, TM_SQDIFF_NORMED
             confidence_score = 1 - min_val
             match_loc = min_loc
         else:
@@ -175,7 +468,8 @@ class TemplateMatcher:
         
         # Check if confidence meets threshold
         if confidence_score < threshold:
-            logger.debug(f"Template {template_name} found but confidence {confidence_score:.2f} < {threshold}")
+            logger.warning(f"Template {template_name} found but confidence {confidence_score:.3f} < threshold {threshold} (match location: {match_loc})")
+            logger.info(f"Best match for {template_name}: location={match_loc}, confidence={confidence_score:.3f}, threshold={threshold}")
             return None
         
         # Calculate center position
@@ -198,12 +492,12 @@ class TemplateMatcher:
         """Multi-scale template matching (like the sample code)"""
         # Convert to grayscale
         if len(search_area.shape) == 3:
-            search_gray = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+            search_gray = _bgr_to_gray_cv2(search_area)
         else:
             search_gray = search_area
             
         if len(template.shape) == 3:
-            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            template_gray = _bgr_to_gray_cv2(template)
         else:
             template_gray = template
         
@@ -211,14 +505,23 @@ class TemplateMatcher:
         best_loc = None
         best_size = None
         
+        # Check if OpenCV is available before starting multi-scale matching
+        if not self._opencv_available or not hasattr(cv2, 'matchTemplate') or not hasattr(cv2, 'minMaxLoc'):
+            if not self._opencv_warning_logged:
+                logger.debug("Skipping multi-scale template matching - OpenCV functions not available (already warned at initialization)")
+                self._opencv_warning_logged = True
+            return None
+        
         logger.debug(f"Multi-scale matching: trying {len(self.scales)} scales")
         
         for scale in self.scales:
             # Resize template
-            resized = cv2.resize(
+            new_size = (int(template_gray.shape[1] * scale), int(template_gray.shape[0] * scale))
+            interpolation = cv2.INTER_CUBIC if hasattr(cv2, 'INTER_CUBIC') else 3
+            resized = _resize_cv2(
                 template_gray,
-                (int(template_gray.shape[1] * scale), int(template_gray.shape[0] * scale)),
-                interpolation=cv2.INTER_CUBIC,
+                new_size,
+                interpolation=interpolation,
             )
             
             # Skip if resized template is larger than search area
@@ -226,8 +529,17 @@ class TemplateMatcher:
                 continue
             
             # Match template
-            res = cv2.matchTemplate(search_gray, resized, self.matching_method)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            try:
+                res = cv2.matchTemplate(search_gray, resized, self.matching_method)
+            except Exception as e:
+                logger.error(f"Error in template matching at scale {scale}: {e}")
+                continue
+            
+            try:
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            except Exception as e:
+                logger.error(f"Error in minMaxLoc at scale {scale}: {e}")
+                continue
             
             if max_val > best_val:
                 best_val = max_val
@@ -236,7 +548,10 @@ class TemplateMatcher:
         
         # Check if confidence meets threshold
         if best_val < threshold or best_loc is None:
-            logger.debug(f"Multi-scale match confidence {best_val:.3f} < {threshold}")
+            logger.warning(f"Template match found but confidence {best_val:.3f} < threshold {threshold} (best match was at {best_loc})")
+            # Log even if below threshold to help debugging
+            if best_loc is not None:
+                logger.info(f"Best match found at location {best_loc} with confidence {best_val:.3f} (threshold: {threshold})")
             return None
         
         # Calculate center position
@@ -280,10 +595,18 @@ class TemplateMatcher:
         
         try:
             # Perform template matching
-            result = cv2.matchTemplate(screenshot, template, self.matching_method)
+            if not hasattr(cv2, 'matchTemplate'):
+                logger.error("cv2.matchTemplate not available - OpenCV installation appears corrupted")
+                return []
+            try:
+                result = cv2.matchTemplate(screenshot, template, self.matching_method)
+            except Exception as e:
+                logger.error(f"Error in template matching: {e}")
+                return []
             
             # Find all matches above threshold
-            if self.matching_method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
+            # Use integer values for comparison (TM_SQDIFF=0, TM_SQDIFF_NORMED=1)
+            if self.matching_method in [0, 1]:  # TM_SQDIFF, TM_SQDIFF_NORMED
                 locations = np.where(result <= (1 - threshold))
                 values = 1 - result[locations]
             else:
@@ -464,8 +787,14 @@ class TemplateMatcher:
         if reader:
             try:
                 # Preprocess for better OCR (like the sample code)
-                gray_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-                gray_crop = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                gray_crop = _bgr_to_gray_cv2(cropped)
+                # Apply thresholding with fallback
+                if hasattr(cv2, 'threshold') and hasattr(cv2, 'THRESH_BINARY') and hasattr(cv2, 'THRESH_OTSU'):
+                    gray_crop = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                else:
+                    # Manual thresholding fallback
+                    from ..utils.tesseract_ocr import _threshold_otsu
+                    gray_crop = _threshold_otsu(gray_crop)
                 
                 # Extract text using Tesseract
                 results = reader.readtext(gray_crop, detail=1, paragraph=False)
@@ -519,8 +848,14 @@ class TemplateMatcher:
         
         try:
             # Preprocess for better OCR (like the sample code)
-            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            gray = _bgr_to_gray_cv2(cropped)
+            # Apply thresholding with fallback
+            if hasattr(cv2, 'threshold') and hasattr(cv2, 'THRESH_BINARY') and hasattr(cv2, 'THRESH_OTSU'):
+                gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            else:
+                # Manual thresholding fallback
+                from ..utils.tesseract_ocr import _threshold_otsu
+                gray = _threshold_otsu(gray)
             
             # Extract text using Tesseract
             results = reader.readtext(gray, detail=1, paragraph=False)

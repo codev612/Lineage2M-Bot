@@ -4,9 +4,8 @@ Handles game actions, state detection, and automated gameplay strategies
 """
 
 import time
-import random
 import gc
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -25,7 +24,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 # Constants
-DEFAULT_SCREEN_TRANSITION_TIME = 30.0  # Default time to wait for screen transitions (seconds)
+DEFAULT_SCREEN_TRANSITION_TIME = 10.0  # Default time to wait for screen transitions (seconds)
 MAX_RETRY_COUNT = 10  # Maximum number of retries for each step before stopping bot
 
 
@@ -52,36 +51,26 @@ class GameAutomation:
         
         # Game state tracking
         self.current_state = 'unknown'
+        self.game_running_state = 'unknown'  # 'not_running' or 'running'
+        self.actual_game_state = 'unknown'  # Actual game state from screenshot: 'select_server', 'select_character', 'playing', etc.
         self.last_action_time = 0
-        self.action_interval = 5.0  # Minimum time between actions (seconds) - increased to reduce CPU
+        self.action_interval = 5.0  # Minimum time between actions (seconds)
+        
+        # Debug mode for detection (set to True to enable screenshot saving and detailed logging)
+        self.debug_detection = True  # Set to False to disable debug features
         
         # Retry tracking for each step
         self.step_retry_count = {}  # Dictionary to track retry count per step
         self.max_retries = MAX_RETRY_COUNT
         
-        # Flag to track if we've already tapped enter button (skip tap screen/enter checks after)
-        self.entered_after_tap = False
-        
         # Screen dimensions (will be detected)
         self.screen_width = 0
         self.screen_height = 0
         
-        # Gameplay parameters
-        self.auto_attack_enabled = True
-        self.auto_collect_enabled = True
-        self.auto_potion_enabled = True
-        self.auto_quest_enabled = True
-        
-        # Action sequences
-        self.action_queue = []
-        
-        # Last action tracking
-        self.last_action = None
-        
         # Screenshot caching to avoid multiple screenshots per loop
         self._last_screenshot = None
         self._last_screenshot_time = 0
-        self._screenshot_cache_ttl = 0.5  # Cache screenshots for 0.5 seconds only (reduced to minimize memory usage)
+        self._screenshot_cache_ttl = 0.5  # Cache screenshots for 0.5 seconds
         
     def start(self):
         """Start the game automation"""
@@ -102,14 +91,13 @@ class GameAutomation:
         
         logger.info("Stopping game automation...")
         self.running = False
-        self.action_queue.clear()
         
         # Clear screenshot cache to free memory
         if self._last_screenshot is not None:
             del self._last_screenshot
             self._last_screenshot = None
             self._last_screenshot_time = 0
-        
+    
     def _detect_screen_size(self):
         """Detect device screen dimensions"""
         screenshot = None
@@ -138,6 +126,7 @@ class GameAutomation:
             # Always release screenshot
             if screenshot is not None:
                 del screenshot
+                gc.collect(0)
     
     def _check_and_reset_retry(self, step_name: str) -> bool:
         """
@@ -167,203 +156,7 @@ class GameAutomation:
         if step_name in self.step_retry_count:
             self.step_retry_count[step_name] = 0
     
-    def run_game_loop(self):
-        """
-        Main game automation loop
-        This is called repeatedly while the bot is running
-        """
-        if not self.running:
-            return
-        
-        try:
-            # Check if game is running
-            is_running, package = self.game_detector.is_lineage2m_running()
-            
-            if not is_running:
-                # Game is not running, try to launch it
-                step_name = "game_launch"
-                logger.info("Game is not running, attempting to launch...")
-                
-                if self._launch_game_if_not_running():
-                    # Wait for game to start
-                    logger.info(f"Game launch attempted, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for game to start...")
-                    time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                    # Check again
-                    is_running, package = self.game_detector.is_lineage2m_running()
-                    if not is_running:
-                        if not self._check_and_reset_retry(step_name):
-                            return  # Bot stopped due to max retries
-                        logger.warning(f"Game launch attempted but still not running, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
-                        time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                        return
-                    else:
-                        # Success - reset retry counter
-                        self._reset_retry(step_name)
-                        
-                        # After game launch, actively wait for "Tap screen" to appear with periodic checks
-                        # Using longer interval (10s) to reduce CPU and memory usage
-                        logger.info("Game is running, waiting for 'Tap screen' text to appear...")
-                        if self._wait_for_tap_screen_text(max_wait_time=60.0, check_interval=10.0):
-                            logger.info("'Tap screen' text detected after game launch")
-                        else:
-                            logger.debug("'Tap screen' text not detected yet, will check in next loop iteration")
-                else:
-                    if not self._check_and_reset_retry(step_name):
-                        return  # Bot stopped due to max retries
-                    logger.warning(f"Failed to launch game, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
-                    time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                    return
-            
-            # Skip tap screen and enter button checks if we've already entered after tapping
-            if not self.entered_after_tap:
-                # Check for "Tap screen" text/image and tap if found (non-blocking check)
-                step_name = "tap_screen"
-                if self._check_and_tap_tap_screen():
-                    # Success - reset retry counter
-                    self._reset_retry(step_name)
-                    
-                    # After tapping "Tap screen", wait for screen transition
-                    logger.info(f"Tapped 'Tap screen', waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for screen transition...")
-                    time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                    
-                    # Wait for enter button to appear and tap it (blocking wait)
-                    step_name = "enter_button"
-                    logger.info("Waiting for enter_button.png to appear...")
-                    if self._wait_and_tap_enter_button(max_wait_time=15.0, check_interval=0.5):
-                        # Success - reset retry counter
-                        self._reset_retry(step_name)
-                        
-                        # After tapping enter button, wait 30 seconds without checking for anything
-                        logger.info(f"Enter button tapped, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s before detecting game state...")
-                        time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-                        
-                        # Mark that we've entered after tapping - skip tap screen/enter checks from now on
-                        self.entered_after_tap = True
-                        
-                        # Now try to detect current game state (skip tap screen and enter button checks)
-                        logger.info("Detecting current game state after enter button tap...")
-                        # Continue to game state detection below (don't return here)
-                    else:
-                        if not self._check_and_reset_retry(step_name):
-                            return  # Bot stopped due to max retries
-                        logger.warning("Enter button not found within timeout, continuing...")
-                        return
-                else:
-                    # Tap screen not detected - check retry count
-                    if not self._check_and_reset_retry(step_name):
-                        return  # Bot stopped due to max retries
-            else:
-                # Already entered after tapping, skip tap screen and enter button checks
-                logger.debug("Already tapped enter button, skipping tap screen/enter button checks, proceeding to game state detection...")
-            
-            # Detect current game state
-            game_state = self.game_detector.detect_game_state()
-            self.current_state = game_state.get('status', 'unknown')
-            
-            # Don't cache screenshot from game_state - it's already processed
-            # Delete it immediately to free memory (don't keep duplicate references)
-            if 'screenshot' in game_state:
-                del game_state['screenshot']
-                gc.collect(0)  # Force GC after deleting screenshot
-            
-            # Execute appropriate actions based on game state
-            if self.current_state == 'in_game':
-                # Success - reset any retry counters and reset entered flag
-                self._reset_retry("game_launch")
-                self._reset_retry("tap_screen")
-                self._reset_retry("enter_button")
-                self.entered_after_tap = False  # Reset flag for next session
-                self._execute_in_game_actions()
-            elif self.current_state == 'main_menu':
-                self._handle_main_menu()
-            elif self.current_state == 'loading_screen':
-                logger.info(f"Waiting for loading screen to complete... ({DEFAULT_SCREEN_TRANSITION_TIME}s)")
-                time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-            elif self.current_state == 'select_server':
-                # Already handled by _wait_and_tap_tap_screen
-                logger.debug(f"Waiting for server selection... ({DEFAULT_SCREEN_TRANSITION_TIME}s)")
-                time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-            elif self.current_state == 'in_game_with_UI':
-                # Success - reset any retry counters and reset entered flag
-                self._reset_retry("game_launch")
-                self._reset_retry("tap_screen")
-                self._reset_retry("enter_button")
-                self.entered_after_tap = False  # Reset flag for next session
-                self._execute_in_game_actions()
-            else:
-                logger.debug(f"Unknown game state: {self.current_state}, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
-                time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-            
-            # Periodic garbage collection to free memory (every 10 loops)
-            # But only if GC hasn't run recently (avoid forcing GC too frequently)
-            if not hasattr(self, '_loop_count'):
-                self._loop_count = 0
-                self._last_gc_time = 0
-            self._loop_count += 1
-            
-            # More aggressive GC - every 5 loops AND at least 3 seconds since last GC
-            current_time = time.time()
-            if self._loop_count % 5 == 0 and (current_time - self._last_gc_time) > 3.0:
-                # Always clear screenshot cache before GC to ensure old screenshots are released
-                if self._last_screenshot is not None:
-                    # Check if cache is old (more than TTL)
-                    if (current_time - self._last_screenshot_time) > self._screenshot_cache_ttl:
-                        del self._last_screenshot
-                        self._last_screenshot = None
-                
-                # Force more aggressive garbage collection
-                gc.collect(0)  # Collect generation 0
-                gc.collect(1)  # Also collect generation 1 for better cleanup
-                self._last_gc_time = current_time
-                
-                # Clear GPU cache if using GPU (PyTorch CUDA cache)
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()  # Clear GPU cache to free VRAM
-                        torch.cuda.synchronize()  # Ensure all GPU operations are complete
-                except:
-                    pass
-                
-        except Exception as e:
-            step_name = "game_loop_error"
-            logger.error(f"Error in game loop: {e}", exc_info=True)
-            if not self._check_and_reset_retry(step_name):
-                return  # Bot stopped due to max retries
-            time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
-    
-    def _execute_in_game_actions(self):
-        """Execute actions when in game"""
-        current_time = time.time()
-        
-        # Check if enough time has passed since last action
-        if current_time - self.last_action_time < self.action_interval:
-            return
-        
-        # Priority 1: Check health and use potions if needed
-        if self.auto_potion_enabled:
-            health_status = self._check_and_use_potions()
-            if STATE_MONITOR_AVAILABLE and self.device_id and health_status:
-                device_state_monitor.update_game_state(
-                    self.device_id,
-                    health_status=health_status
-                )
-        
-        # Priority 2: Auto-attack if enabled
-        if self.auto_attack_enabled:
-            self._auto_attack()
-        
-        # Priority 3: Collect items if enabled
-        if self.auto_collect_enabled:
-            self._collect_items()
-        
-        # Priority 4: Handle quests/auto-quest if enabled
-        if self.auto_quest_enabled:
-            self._handle_quests()
-        
-        self.last_action_time = current_time
-        
-    def _launch_game_if_not_running(self) -> bool:
+    def _launch_game(self) -> bool:
         """
         Launch the game if it's not running
         
@@ -378,7 +171,7 @@ class GameAutomation:
                 logger.warning("No game packages configured")
                 return False
             
-            # Check if any package is installed
+            # Try to launch the first available package
             for package in game_packages:
                 # Check if package is installed
                 success, output = self.adb.execute_adb_command(['shell', 'pm', 'list', 'packages', package])
@@ -398,46 +191,120 @@ class GameAutomation:
             logger.error(f"Error launching game: {e}", exc_info=True)
             return False
     
-    def _wait_for_tap_screen_text(self, max_wait_time: float = 60.0, check_interval: float = 10.0) -> bool:
+    def run_game_loop(self):
         """
-        Wait for "Tap screen" text to appear and tap it (blocking wait with periodic checks)
+        Main game automation loop
+        This is called repeatedly while the bot is running
+        """
+        if not self.running:
+            return
         
-        Args:
-            max_wait_time: Maximum time to wait in seconds (default: 60)
-            check_interval: Interval between checks in seconds (default: 2.0)
-            
-        Returns:
-            True if "Tap screen" was detected and tapped, False otherwise
-        """
         try:
-            start_time = time.time()
-            check_count = 0
+            # Check if game is running
+            is_running, package = self.game_detector.is_lineage2m_running()
             
-            logger.info(f"Waiting for 'Tap screen' text to appear (max {max_wait_time}s, checking every {check_interval}s)...")
-            
-            while time.time() - start_time < max_wait_time:
-                check_count += 1
-                elapsed = time.time() - start_time
+            if not is_running:
+                # Game is not running - set state to "not_running" and launch game
+                self.game_running_state = 'not_running'
+                self.current_state = 'not_running'
+                self.actual_game_state = 'unknown'
                 
-                # Check for "Tap screen" text (with reduced frequency to save CPU)
-                if self._check_and_tap_tap_screen():
-                    logger.info(f"'Tap screen' detected and tapped after {elapsed:.1f}s (check #{check_count})")
-                    return True
+                logger.info("Game is not running, setting state to 'not_running' and attempting to launch...")
+                step_name = "game_launch"
                 
-                # Log progress every 15 seconds (reduced logging frequency)
-                if check_count % (int(15 / check_interval)) == 0:
-                    logger.debug(f"Still waiting for 'Tap screen' text... ({elapsed:.1f}s elapsed, check #{check_count})")
+                if self._launch_game():
+                    # Wait for game to start
+                    logger.info(f"Game launch attempted, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s for game to start...")
+                    time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+                    
+                    # Verify game is now running
+                    is_running, package = self.game_detector.is_lineage2m_running()
+                    if not is_running:
+                        # Game still not running after launch attempt
+                        if not self._check_and_reset_retry(step_name):
+                            return  # Bot stopped due to max retries
+                        logger.warning(f"Game launch attempted but still not running, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
+                        time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+                        return
+                    else:
+                        # Success - reset retry counter
+                        self._reset_retry(step_name)
+                        logger.info("Game successfully launched")
+                        # State will be updated to 'running' in next loop iteration
+                else:
+                    # Failed to launch game
+                    if not self._check_and_reset_retry(step_name):
+                        return  # Bot stopped due to max retries
+                    logger.warning(f"Failed to launch game, waiting {DEFAULT_SCREEN_TRANSITION_TIME}s...")
+                    time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+                    return
+            else:
+                # Game is running - set state to "running" and detect actual game state from screenshot
+                self.game_running_state = 'running'
+                self.current_state = 'running'
                 
-                # Wait before next check
-                time.sleep(check_interval)
+                logger.info("Game is running - attempting to detect actual game state from screenshot...")
+                
+                # Take a screenshot for state detection
+                logger.debug("Taking screenshot for game state detection...")
+                screenshot = self._get_cached_screenshot()
+                if screenshot is None:
+                    logger.debug("Cached screenshot not available, taking new screenshot...")
+                    screenshot = self.adb.take_screenshot()
+                
+                if screenshot is not None:
+                    logger.info(f"Screenshot captured successfully (shape: {screenshot.shape})")
+                    # Detect actual game state based on specific element combinations
+                    logger.info("Calling detect_game_state_from_screenshot()...")
+                    self.actual_game_state = self.game_detector.detect_game_state_from_screenshot(
+                        screenshot, 
+                        debug=self.debug_detection
+                    )
+                    logger.info(f"Detection complete! Game running state: 'running', Actual game state detected: '{self.actual_game_state}'")
+                    
+                    # Get detailed detection results for debugging
+                    if self.debug_detection:
+                        detailed_results = self.game_detector.get_detection_results(screenshot)
+                        logger.info(f"Detailed detection results: {detailed_results}")
+                else:
+                    logger.warning("Could not take screenshot for game state detection - setting state to 'unknown'")
+                    self.actual_game_state = 'unknown'
             
-            elapsed = time.time() - start_time
-            logger.debug(f"'Tap screen' text not detected within {max_wait_time} seconds (checked {check_count} times, {elapsed:.1f}s elapsed)")
-            return False
+            # State-based actions can use:
+            # - self.game_running_state: 'not_running' or 'running'
+            # - self.actual_game_state: 'select_server', 'select_character', 'playing', 'unknown', etc.
+            # - self.current_state: 'not_running' or 'running' (same as game_running_state)
             
+            # Periodic garbage collection
+            if not hasattr(self, '_loop_count'):
+                self._loop_count = 0
+            self._loop_count += 1
+            
+            if self._loop_count % 10 == 0:
+                gc.collect(0)
+                
         except Exception as e:
-            logger.error(f"Error waiting for tap screen text: {e}", exc_info=True)
-            return False
+            logger.error(f"Error in game loop: {e}", exc_info=True)
+            step_name = "game_loop_error"
+            if not self._check_and_reset_retry(step_name):
+                return
+            time.sleep(DEFAULT_SCREEN_TRANSITION_TIME)
+    
+    def get_game_state(self) -> Dict[str, str]:
+        """
+        Get current game state information
+        
+        Returns:
+            Dictionary with game state information:
+            - 'running_state': 'not_running' or 'running'
+            - 'current_state': 'not_running' or 'running' (same as running_state)
+            - 'actual_game_state': Actual game state from screenshot ('select_server', 'select_character', 'playing', 'unknown', etc.)
+        """
+        return {
+            'running_state': self.game_running_state,
+            'current_state': self.current_state,
+            'actual_game_state': self.actual_game_state
+        }
     
     def _get_cached_screenshot(self, force_new: bool = False):
         """
@@ -459,466 +326,12 @@ class GameAutomation:
             if self._last_screenshot is not None:
                 del self._last_screenshot
                 self._last_screenshot = None
-                # Force immediate garbage collection after deleting screenshot
                 gc.collect(0)
             
             self._last_screenshot = self.adb.take_screenshot()
             self._last_screenshot_time = current_time
         
         return self._last_screenshot
-    
-    def _check_and_tap_tap_screen(self) -> bool:
-        """
-        Check for "Tap screen" text or image and tap if found (non-blocking single check)
-        
-        Returns:
-            True if "Tap screen" was detected and tapped, False otherwise
-        """
-        try:
-            # Use cached screenshot to avoid multiple screenshots per loop
-            screenshot = self._get_cached_screenshot()
-            if screenshot is None:
-                return False
-            
-            try:
-                # Check for "Tap screen" text using OCR
-                tap_screen_detected = self.game_detector._detect_tap_screen_text(screenshot)
-                
-                if tap_screen_detected:
-                    logger.info("'Tap screen' text detected, attempting to find position and tap...")
-                    
-                    # Try to find tap screen position using OCR results
-                    tap_position = self._find_tap_screen_position(screenshot)
-                    
-                    if tap_position:
-                        x, y = tap_position
-                        logger.info(f"Tapping at detected position: ({x}, {y})")
-                        self.adb.tap(x, y)
-                        
-                        if STATE_MONITOR_AVAILABLE and self.device_id:
-                            device_state_monitor.update_game_state(
-                                self.device_id,
-                                action="tap_screen"
-                            )
-                        
-                        return True
-                    else:
-                        # If text detected but position not found, tap center of screen
-                        logger.info("'Tap screen' text detected but position not found, tapping center of screen")
-                        center_x = self.screen_width // 2 if self.screen_width > 0 else 540
-                        center_y = self.screen_height // 2 if self.screen_height > 0 else 960
-                        self.adb.tap(center_x, center_y)
-                        
-                        if STATE_MONITOR_AVAILABLE and self.device_id:
-                            device_state_monitor.update_game_state(
-                                self.device_id,
-                                action="tap_screen_center"
-                            )
-                        
-                        return True
-                
-                # Also check for "Tap screen" image template if available
-                try:
-                    from ..utils.template_matcher import TemplateMatcher
-                    template_matcher = TemplateMatcher()
-                    
-                    # Try to find "tap_screen" template
-                    tap_result = template_matcher.find_template(screenshot, "tap_screen.png", multi_scale=True)
-                    if tap_result:
-                        x, y, confidence = tap_result
-                        logger.info(f"'Tap screen' image detected at ({x}, {y}) with confidence {confidence:.3f}, tapping...")
-                        self.adb.tap(x, y)
-                        
-                        if STATE_MONITOR_AVAILABLE and self.device_id:
-                            device_state_monitor.update_game_state(
-                                self.device_id,
-                                action="tap_screen_image"
-                            )
-                        
-                        return True
-                except Exception as e:
-                    logger.debug(f"Template matching for tap screen failed: {e}")
-                
-                return False
-            finally:
-                # Don't delete screenshot here - it's cached and will be reused
-                pass
-            
-        except Exception as e:
-            logger.debug(f"Error checking tap screen: {e}")
-            return False
-    
-    def _wait_and_tap_enter_button(self, max_wait_time: float = 15.0, check_interval: float = 0.5) -> bool:
-        """
-        Wait for enter_button.png template to appear, then tap it
-        
-        Args:
-            max_wait_time: Maximum time to wait in seconds (default: 15)
-            check_interval: Interval between checks in seconds (default: 0.5)
-            
-        Returns:
-            True if enter button was detected and tapped, False otherwise
-        """
-        try:
-            from ..utils.template_matcher import TemplateMatcher
-            template_matcher = TemplateMatcher()
-            
-            start_time = time.time()
-            check_count = 0
-            
-            logger.info(f"Waiting for enter_button.png to appear (max {max_wait_time}s, checking every {check_interval}s)...")
-            
-            while time.time() - start_time < max_wait_time:
-                check_count += 1
-                elapsed = time.time() - start_time
-                screenshot = None
-                
-                try:
-                    # Use cached screenshot if available (within cache TTL)
-                    screenshot = self._get_cached_screenshot()
-                    if screenshot is None:
-                        logger.debug(f"Could not take screenshot for enter button detection (check #{check_count}, {elapsed:.1f}s elapsed)")
-                        time.sleep(check_interval)
-                        continue
-                    
-                    # Try to find enter_button.png template
-                    try:
-                        enter_result = template_matcher.find_template(screenshot, "enter_button.png", multi_scale=True)
-                        if enter_result:
-                            x, y, confidence = enter_result
-                            logger.info(f"[OK] enter_button.png detected at ({x}, {y}) with confidence {confidence:.3f} (after {elapsed:.1f}s), tapping...")
-                            self.adb.tap(x, y)
-                            
-                            if STATE_MONITOR_AVAILABLE and self.device_id:
-                                device_state_monitor.update_game_state(
-                                    self.device_id,
-                                    action="tap_enter_button"
-                                )
-                            
-                            return True
-                        else:
-                            # Log progress every 2 seconds
-                            if check_count % 4 == 0:  # Every 2 seconds (4 checks * 0.5s)
-                                logger.debug(f"Still waiting for enter_button.png... ({elapsed:.1f}s elapsed, check #{check_count})")
-                    except Exception as e:
-                        logger.debug(f"Template matching for enter button failed (check #{check_count}): {e}")
-                finally:
-                    # Don't delete screenshot here - it's cached and will be reused
-                    # Screenshot is managed by cache system
-                    pass
-                
-                # Wait before next check
-                time.sleep(check_interval)
-            
-            elapsed = time.time() - start_time
-            logger.warning(f"enter_button.png not detected within {max_wait_time} seconds (checked {check_count} times, {elapsed:.1f}s elapsed)")
-            return False
-            
-        except ImportError as e:
-            logger.warning(f"TemplateMatcher not available for enter button detection: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Error waiting for enter button: {e}", exc_info=True)
-            return False
-    
-    def _find_tap_screen_position(self, screenshot: np.ndarray) -> Optional[Tuple[int, int]]:
-        """
-        Find the position of "Tap screen" text using OCR
-        
-        Args:
-            screenshot: Screenshot image
-            
-        Returns:
-            Tuple of (x, y) coordinates if found, None otherwise
-        """
-        try:
-            # Use Tesseract OCR reader (lightweight, ~100MB vs ~2GB for EasyOCR)
-            from ..utils.tesseract_ocr import get_tesseract_reader
-            ocr_reader = get_tesseract_reader(lang='eng')
-            if ocr_reader is None:
-                logger.debug("Tesseract OCR not available for position detection")
-                return None
-            
-            # Process image at full device resolution (no downsampling)
-            # This ensures coordinates match device dimensions exactly
-            height, width = screenshot.shape[:2]
-            
-            try:
-                # Perform OCR on full resolution screenshot (Tesseract works with BGR directly)
-                results = ocr_reader.readtext(screenshot, detail=1, paragraph=False)
-                
-                # Search for "Tap screen" variations
-                tap_screen_variations = [
-                    'tap screen',
-                    'tap to screen',
-                    'tap the screen',
-                    'tap screen to',
-                    'tap',
-                    'tap to start',
-                    'tap to begin'
-                ]
-                
-                position = None
-                for (bbox, text, confidence) in results:
-                    text_lower = text.lower().strip()
-                    for variation in tap_screen_variations:
-                        if variation in text_lower:
-                            # Calculate center of bounding box
-                            # bbox is a list of 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                            if len(bbox) >= 4:
-                                # Get all x and y coordinates
-                                xs = [point[0] for point in bbox]
-                                ys = [point[1] for point in bbox]
-                                
-                                # Calculate center (no scaling needed - already at full resolution)
-                                center_x = int(sum(xs) / len(xs))
-                                center_y = int(sum(ys) / len(ys))
-                                
-                                logger.info(f"Found 'Tap screen' text '{text}' at ({center_x}, {center_y})")
-                                position = (center_x, center_y)
-                                break
-                    if position:
-                        break
-                
-                # Clear OCR results to free memory immediately
-                del results
-                return position
-                
-            finally:
-                # Force garbage collection after OCR
-                gc.collect(0)
-            
-        except Exception as e:
-            logger.debug(f"Error finding tap screen position: {e}")
-            return None
-    
-    def _check_and_use_potions(self) -> Optional[str]:
-        """Check HP/MP and use potions if needed
-        
-        Returns:
-            Health status string (e.g., 'low_hp', 'low_mp', 'healthy')
-        """
-        try:
-            # Take screenshot for analysis
-            screenshot = self.adb.take_screenshot()
-            if screenshot is None:
-                return None
-            
-            try:
-                health_status = "healthy"
-                
-                # Analyze health bar area (typically at top of screen)
-                # Health bar is usually in top-left or top-center area
-                # Create explicit copy to avoid keeping reference to full screenshot
-                health_region = screenshot[0:self.screen_height//10, 0:self.screen_width//3].copy()
-                
-                # Simple heuristic: Check if health bar area is mostly red (low health)
-                # Convert to HSV for better color detection
-                hsv_region = cv2.cvtColor(health_region, cv2.COLOR_BGR2HSV)
-                
-                # Red color range in HSV (for low health indicator)
-                lower_red = np.array([0, 100, 100])
-                upper_red = np.array([10, 255, 255])
-                
-                # Create mask for red pixels
-                red_mask = cv2.inRange(hsv_region, lower_red, upper_red)
-                red_ratio = np.sum(red_mask > 0) / (health_region.shape[0] * health_region.shape[1])
-                
-                # Release intermediate images
-                del health_region, hsv_region, red_mask
-                
-                # If significant red detected (low health), use HP potion
-                if red_ratio > 0.3:
-                    logger.info("Low health detected, using HP potion...")
-                    self._use_hp_potion()
-                    health_status = "low_hp"
-                    time.sleep(0.5)
-                
-                # Check MP (mana) - typically blue or green bar
-                # Create explicit copy to avoid keeping reference to full screenshot
-                mp_region = screenshot[0:self.screen_height//10, self.screen_width//3:self.screen_width*2//3].copy()
-                mp_brightness = np.mean(cv2.cvtColor(mp_region, cv2.COLOR_BGR2GRAY))
-                
-                # Release intermediate image
-                del mp_region
-                
-                # If MP bar is dark (low mana), use MP potion
-                if mp_brightness < 100:
-                    logger.info("Low MP detected, using MP potion...")
-                    self._use_mp_potion()
-                    if health_status == "healthy":
-                        health_status = "low_mp"
-                    else:
-                        health_status = "low_hp_mp"
-                    time.sleep(0.5)
-                
-                return health_status
-            finally:
-                # Don't delete screenshot here - it's cached and will be reused
-                pass
-                
-        except Exception as e:
-            logger.debug(f"Error checking potions: {e}")
-            return None
-    
-    def _use_hp_potion(self):
-        """Use HP potion (typically F1 key or button)"""
-        # HP potion is usually mapped to a specific key or button
-        # Common locations: Top of screen, quick slot, or number key
-        # For now, we'll tap a common HP potion location (adjust based on your UI)
-        # This is a placeholder - you'll need to adjust coordinates based on your game UI
-        
-        # Option 1: Tap quick slot button (if HP potion is in quick slot)
-        # This is typically in bottom-right area
-        potion_x = int(self.screen_width * 0.85)
-        potion_y = int(self.screen_height * 0.85)
-        
-        self._tap(potion_x, potion_y)
-        self.last_action = "use_hp_potion"
-        
-        # Update state monitor
-        if STATE_MONITOR_AVAILABLE and self.device_id:
-            device_state_monitor.update_game_state(
-                self.device_id,
-                action="use_hp_potion",
-                health_status="used_hp_potion"
-            )
-        
-        logger.info(f"Used HP potion at ({potion_x}, {potion_y})")
-    
-    def _use_mp_potion(self):
-        """Use MP potion (typically F2 key or button)"""
-        # Similar to HP potion, adjust coordinates
-        potion_x = int(self.screen_width * 0.90)
-        potion_y = int(self.screen_height * 0.85)
-        
-        self._tap(potion_x, potion_y)
-        self.last_action = "use_mp_potion"
-        
-        # Update state monitor
-        if STATE_MONITOR_AVAILABLE and self.device_id:
-            device_state_monitor.update_game_state(
-                self.device_id,
-                action="use_mp_potion",
-                health_status="used_mp_potion"
-            )
-        
-        logger.info(f"Used MP potion at ({potion_x}, {potion_y})")
-    
-    def _auto_attack(self):
-        """Auto-attack nearby enemies"""
-        try:
-            # Use cached screenshot to avoid multiple screenshots per loop
-            screenshot = self._get_cached_screenshot()
-            if screenshot is None:
-                return
-            
-            try:
-                # Attack button is typically in bottom-center or bottom-right
-                # Common location for auto-attack button
-                attack_x = int(self.screen_width * 0.5)
-                attack_y = int(self.screen_height * 0.9)
-                
-                # Tap attack button
-                self._tap(attack_x, attack_y)
-                self.last_action = "auto_attack"
-                
-                # Update state monitor
-                if STATE_MONITOR_AVAILABLE and self.device_id:
-                    device_state_monitor.update_game_state(
-                        self.device_id,
-                        action="auto_attack"
-                    )
-                
-                logger.debug(f"Auto-attack executed at ({attack_x}, {attack_y})")
-                
-                # Small delay after attack
-                time.sleep(0.3)
-            finally:
-                # Don't delete screenshot here - it's cached and will be reused
-                pass
-            
-        except Exception as e:
-            logger.debug(f"Error in auto-attack: {e}")
-    
-    def _collect_items(self):
-        """Collect items on the ground"""
-        try:
-            # Use cached screenshot to avoid multiple screenshots per loop
-            screenshot = self._get_cached_screenshot()
-            if screenshot is None:
-                return
-            
-            try:
-                # Look for item indicators on screen
-                # Items are typically marked with icons or text
-                # For now, we'll use a simple approach: tap center area where items might be
-                
-                # Item collection is usually done by tapping the item or using collect button
-                # Common locations: center of screen or bottom area
-                collect_x = int(self.screen_width * 0.5 + random.randint(-50, 50))
-                collect_y = int(self.screen_height * 0.6 + random.randint(-50, 50))
-                
-                self._tap(collect_x, collect_y)
-                self.last_action = "collect_items"
-            finally:
-                # Don't delete screenshot here - it's cached and will be reused
-                pass
-            
-            # Update state monitor
-            if STATE_MONITOR_AVAILABLE and self.device_id:
-                device_state_monitor.update_game_state(
-                    self.device_id,
-                    action="collect_items"
-                )
-            
-            logger.debug(f"Attempted to collect item at ({collect_x}, {collect_y})")
-            
-            time.sleep(0.2)
-            
-        except Exception as e:
-            logger.debug(f"Error collecting items: {e}")
-    
-    def _handle_quests(self):
-        """Handle quest-related actions"""
-        try:
-            # Check for quest completion notifications
-            # Quest notifications are typically at top or side of screen
-            
-            # Use cached screenshot to avoid multiple screenshots per loop
-            screenshot = self._get_cached_screenshot()
-            if screenshot is None:
-                return
-            
-            try:
-                # Look for quest notification indicators
-                # This is a placeholder - implement based on your game's UI
-                
-                # For now, we'll just check periodically
-                # Quest completion is often indicated by specific UI elements
-                pass  # Placeholder for future quest handling logic
-            finally:
-                # Don't delete screenshot here - it's cached and will be reused
-                pass
-            
-        except Exception as e:
-            logger.debug(f"Error handling quests: {e}")
-    
-    def _handle_main_menu(self):
-        """Handle actions when in main menu"""
-        try:
-            logger.info("In main menu, attempting to enter game...")
-            
-            # Tap "Start" or "Enter Game" button
-            # Common locations: center of screen
-            start_x = int(self.screen_width * 0.5)
-            start_y = int(self.screen_height * 0.7)
-            
-            self._tap(start_x, start_y)
-            time.sleep(2)
-            
-        except Exception as e:
-            logger.debug(f"Error handling main menu: {e}")
     
     def _tap(self, x: int, y: int, duration: float = 0.1):
         """
@@ -930,16 +343,9 @@ class GameAutomation:
             duration: Tap duration in seconds
         """
         try:
-            success, output = self.adb.execute_adb_command([
-                'shell', 'input', 'tap', str(x), str(y)
-            ])
-            
-            if success:
-                logger.debug(f"Tapped at ({x}, {y})")
-                time.sleep(duration)
-            else:
-                logger.warning(f"Failed to tap at ({x}, {y}): {output}")
-                
+            self.adb.tap(x, y)
+            logger.debug(f"Tapped at ({x}, {y})")
+            time.sleep(duration)
         except Exception as e:
             logger.error(f"Error tapping at ({x}, {y}): {e}")
     
@@ -964,27 +370,5 @@ class GameAutomation:
                 logger.debug(f"Swiped from ({x1}, {y1}) to ({x2}, {y2})")
             else:
                 logger.warning(f"Failed to swipe: {output}")
-                
         except Exception as e:
             logger.error(f"Error swiping: {e}")
-    
-    def set_auto_attack(self, enabled: bool):
-        """Enable/disable auto-attack"""
-        self.auto_attack_enabled = enabled
-        logger.info(f"Auto-attack: {'enabled' if enabled else 'disabled'}")
-    
-    def set_auto_collect(self, enabled: bool):
-        """Enable/disable auto-collect"""
-        self.auto_collect_enabled = enabled
-        logger.info(f"Auto-collect: {'enabled' if enabled else 'disabled'}")
-    
-    def set_auto_potion(self, enabled: bool):
-        """Enable/disable auto-potion"""
-        self.auto_potion_enabled = enabled
-        logger.info(f"Auto-potion: {'enabled' if enabled else 'disabled'}")
-    
-    def set_auto_quest(self, enabled: bool):
-        """Enable/disable auto-quest"""
-        self.auto_quest_enabled = enabled
-        logger.info(f"Auto-quest: {'enabled' if enabled else 'disabled'}")
-

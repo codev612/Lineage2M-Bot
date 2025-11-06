@@ -1,9 +1,12 @@
 # Core dependencies
 adb-shell==0.4.4
 opencv-python==4.8.1.78
-numpy==1.24.3
-pillow==10.0.1
-psutil==5.9.5
+numpy>=1.26.0,<2.0.0  # Python 3.12 compatible (OpenCV 4.8.1.78 requires NumPy 1.x)
+pillow>=10.0.1
+psutil>=5.9.5
+
+# GUI dependencies
+customtkinter>=5.2.0  # Modern GUI framework (required for GUI)
 
 # Configuration and utilities
 pyyaml>=6.0
@@ -11,4 +14,5 @@ python-dotenv>=1.0.0
 
 # Optional dependencies for advanced features
 pytesseract>=0.3.10  # For OCR functionality (replaces EasyOCR, uses ~100MB vs ~2GB)
-# mss>=7.0.1          # For faster screenshots
+scipy>=1.11.0  # Optional: For advanced image processing (Canny edge detection fallback, has fallback if not installed)
+# mss>=7.0.1          # Optional: For faster screenshots
