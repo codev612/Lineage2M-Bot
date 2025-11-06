@@ -14,6 +14,7 @@ build/
 # Bot specific
 logs/
 screenshots/
+debug_screenshots/
 temp_*.png
 *.log
 

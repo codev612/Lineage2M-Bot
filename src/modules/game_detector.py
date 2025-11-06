@@ -3,7 +3,7 @@ Game Detector Module - Detects Lineage 2M game state and status
 Handles game detection, state analysis, and game-specific operations
 """
 
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Any
 import re
 import cv2
 import numpy as np
@@ -227,6 +227,7 @@ class GameDetector:
         # Region configurations (loaded from JSON)
         self.regions = {}
         self.device_id = None  # Will be set when device is connected
+        
         
         # Game state detection patterns
         self.state_text_patterns = {
@@ -896,6 +897,256 @@ class GameDetector:
             logger.debug(f"Error in debug short button detection: {e}")
             return {'detected': False, 'position': None}
     
+    def _detect_quest_button_only(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect quest button in agent_quest_region (detection only, no tapping)
+        
+        Args:
+            screenshot: OpenCV image array (full screenshot)
+            
+        Returns:
+            True if button was detected, False otherwise
+        """
+        try:
+            # Get agent_quest_region
+            agent_quest_region = self._get_region('agent_quest_region')
+            if not agent_quest_region:
+                logger.debug("agent_quest_region not configured - cannot detect quest button")
+                return False
+            
+            x1, y1, x2, y2 = agent_quest_region
+            
+            # Ensure coordinates are within screenshot bounds
+            x1 = max(0, min(x1, screenshot.shape[1]))
+            y1 = max(0, min(y1, screenshot.shape[0]))
+            x2 = max(0, min(x2, screenshot.shape[1]))
+            y2 = max(0, min(y2, screenshot.shape[0]))
+            
+            if x2 <= x1 or y2 <= y1:
+                return False
+            
+            # Convert region to (x, y, width, height) format for template matcher
+            region_width = x2 - x1
+            region_height = y2 - y1
+            search_region = (x1, y1, region_width, region_height)
+            
+            # Search for quest_button.png within the region
+            result = self.template_matcher.find_template(
+                screenshot, 
+                "quest_button.png", 
+                multi_scale=True, 
+                confidence=0.7,
+                region=search_region
+            )
+            
+            return result is not None
+            
+        except Exception as e:
+            logger.debug(f"Error detecting quest button: {e}")
+            return False
+    
+    def detect_and_tap_unknown_state_buttons(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect and tap buttons that appear in unknown state:
+        - confirm_button_1.png
+        - claim_reward_button.png
+        - accept_button.png
+        
+        Args:
+            screenshot: OpenCV image array (full screenshot)
+            
+        Returns:
+            True if any button was detected and tapped, False otherwise
+        """
+        try:
+            # List of buttons to check in order
+            buttons_to_check = [
+                "confirm_button_1.png",
+                "claim_reward_button.png",
+                "accept_button.png"
+            ]
+            
+            logger.info("Checking for unknown state buttons (confirm_button_1, claim_reward_button, accept_button)...")
+            
+            # Search for each button in the full screenshot (no specific region)
+            for button_template in buttons_to_check:
+                result = self.template_matcher.find_template(
+                    screenshot,
+                    button_template,
+                    multi_scale=True,
+                    confidence=0.7
+                )
+                
+                if result:
+                    x, y, confidence = result
+                    button_name = button_template.replace(".png", "")
+                    logger.info(f"[OK] {button_name} detected at ({x}, {y}) with confidence {confidence:.3f}")
+                    
+                    # Tap the button
+                    if self.adb and hasattr(self.adb, 'tap'):
+                        success = self.adb.tap(int(x), int(y))
+                        if success:
+                            logger.info(f"[OK] Successfully tapped {button_name} at ({x}, {y})")
+                            return True
+                        else:
+                            logger.warning(f"[FAIL] Failed to tap {button_name} at ({x}, {y})")
+                            # Continue to next button if tap failed
+                            continue
+                    else:
+                        logger.warning("ADB manager not available or tap method not found")
+                        return False
+            
+            logger.debug("No unknown state buttons detected (confirm_button_1, claim_reward_button, accept_button)")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error detecting/tapping unknown state buttons: {e}")
+            return False
+    
+    def detect_and_tap_agent_quest_button(self, screenshot: np.ndarray) -> bool:
+        """
+        Detect quest button in agent_quest_region, tap it, then wait for and tap confirm button
+        
+        Args:
+            screenshot: OpenCV image array (full screenshot)
+            
+        Returns:
+            True if quest button was detected and tapped (and confirm button was tapped), False otherwise
+        """
+        try:
+            # Get agent_quest_region
+            agent_quest_region = self._get_region('agent_quest_region')
+            if not agent_quest_region:
+                logger.debug("agent_quest_region not configured - cannot detect quest button")
+                return False
+            
+            x1, y1, x2, y2 = agent_quest_region
+            logger.info(f"Checking for quest button in region: ({x1}, {y1}, {x2}, {y2})")
+            
+            # Ensure coordinates are within screenshot bounds
+            x1 = max(0, min(x1, screenshot.shape[1]))
+            y1 = max(0, min(y1, screenshot.shape[0]))
+            x2 = max(0, min(x2, screenshot.shape[1]))
+            y2 = max(0, min(y2, screenshot.shape[0]))
+            
+            if x2 <= x1 or y2 <= y1:
+                logger.warning(f"Invalid agent_quest_region coordinates: ({x1}, {y1}, {x2}, {y2})")
+                return False
+            
+            # Convert region to (x, y, width, height) format for template matcher
+            region_width = x2 - x1
+            region_height = y2 - y1
+            search_region = (x1, y1, region_width, region_height)
+            logger.debug(f"Searching for quest_button.png in region: ({x1}, {y1}, {region_width}, {region_height})")
+            
+            # Search for quest_button.png within the region
+            result = self.template_matcher.find_template(
+                screenshot, 
+                "quest_button.png", 
+                multi_scale=True, 
+                confidence=0.7,
+                region=search_region
+            )
+            
+            if result:
+                x, y, confidence = result
+                logger.info(f"[OK] Quest button detected at ({x}, {y}) with confidence {confidence:.3f}")
+                
+                # Tap the quest button
+                if self.adb and hasattr(self.adb, 'tap'):
+                    success = self.adb.tap(int(x), int(y))
+                    if success:
+                        logger.info(f"[OK] Successfully tapped quest button at ({x}, {y})")
+                        
+                        # After tapping quest button, wait for confirm button and tap it
+                        logger.info("Waiting for confirm button to appear...")
+                        confirm_tapped = self._wait_and_tap_confirm_button(max_wait_seconds=5.0)
+                        if confirm_tapped:
+                            logger.info("[OK] Confirm button detected and tapped successfully - setting state to auto_questing")
+                            # Return a special value to indicate confirm button was tapped
+                            return 'auto_questing'
+                        else:
+                            logger.warning("[WARN] Quest button tapped but confirm button not found within timeout")
+                            return True  # Return True because quest button was tapped successfully
+                    else:
+                        logger.warning(f"[FAIL] Failed to tap quest button at ({x}, {y})")
+                        return False
+                else:
+                    logger.warning("ADB manager not available or tap method not found")
+                    return False
+            
+            logger.debug("Quest button not found in agent_quest_region")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error detecting/tapping quest button: {e}")
+            return False
+    
+    def _wait_and_tap_confirm_button(self, max_wait_seconds: float = 5.0, check_interval: float = 0.5) -> bool:
+        """
+        Wait for confirm_button_1.png to appear and tap it
+        
+        Args:
+            max_wait_seconds: Maximum time to wait for confirm button (default: 5 seconds)
+            check_interval: Interval between checks in seconds (default: 0.5 seconds)
+            
+        Returns:
+            True if confirm button was detected and tapped, False otherwise
+        """
+        try:
+            import time
+            start_time = time.time()
+            check_count = 0
+            
+            logger.debug(f"Waiting for confirm_button_1.png (max wait: {max_wait_seconds}s, check interval: {check_interval}s)")
+            
+            while (time.time() - start_time) < max_wait_seconds:
+                check_count += 1
+                
+                # Take a new screenshot to check for confirm button
+                screenshot = self.adb.take_screenshot()
+                if screenshot is None:
+                    logger.debug("Could not take screenshot while waiting for confirm button")
+                    time.sleep(check_interval)
+                    continue
+                
+                # Search for confirm_button_1.png in the full screenshot
+                result = self.template_matcher.find_template(
+                    screenshot,
+                    "confirm_button_1.png",
+                    multi_scale=True,
+                    confidence=0.7
+                )
+                
+                if result:
+                    x, y, confidence = result
+                    elapsed_time = time.time() - start_time
+                    logger.info(f"[OK] Confirm button detected at ({x}, {y}) with confidence {confidence:.3f} after {elapsed_time:.2f}s")
+                    
+                    # Tap the confirm button
+                    if self.adb and hasattr(self.adb, 'tap'):
+                        success = self.adb.tap(int(x), int(y))
+                        if success:
+                            logger.info(f"[OK] Successfully tapped confirm button at ({x}, {y})")
+                            return True
+                        else:
+                            logger.warning(f"[FAIL] Failed to tap confirm button at ({x}, {y})")
+                            return False
+                    else:
+                        logger.warning("ADB manager not available or tap method not found")
+                        return False
+                
+                # Wait before next check
+                time.sleep(check_interval)
+            
+            elapsed_time = time.time() - start_time
+            logger.warning(f"[TIMEOUT] Confirm button not found after {elapsed_time:.2f}s (checked {check_count} times)")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error waiting for/tapping confirm button: {e}")
+            return False
+    
     def _save_template_images(self, template_names: list):
         """Save template images to debug folder for reference"""
         try:
@@ -931,7 +1182,9 @@ class GameDetector:
             debug: If True, save screenshot and detailed detection results
             
         Returns:
-            Game state string: 'select_server', 'select_character', 'playing', or 'unknown'
+            Game state string: 
+            - 'select_server', 'select_character', 'unknown'
+            - 'playing' (in-game state)
         """
         try:
             logger.info("Starting game state detection from screenshot...")
@@ -1029,27 +1282,13 @@ class GameDetector:
             logger.info(f"  - short_button.png detected: {fight_button_detected}")
             
             if fight_button_detected:
-                detected_state = 'playing'
-                logger.info(f"Game state detected: {detected_state} (short_button.png)")
-                
-                # After detecting "playing" state, check if player is fighting
-                logger.info("Checking if player is fighting...")
-                is_fighting, fighting_details = self.detect_fighting_state(screenshot)
-                if is_fighting:
-                    logger.info(f"Player is fighting - Reason: {fighting_details.get('reason', 'unknown')}")
-                else:
-                    logger.info(f"Player is not fighting - Reason: {fighting_details.get('reason', 'unknown')}")
+                logger.info("Game state detected: 'playing' (short_button.png found)")
                 
                 if debug:
-                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                    self._save_debug_screenshot(screenshot, "detected_playing", annotations)
                     self._save_template_images(['short_button.png'])
-                    # Include fighting state in detection results
-                    annotations['fighting_state'] = {
-                        'is_fighting': is_fighting,
-                        'details': fighting_details
-                    }
                 
-                return detected_state
+                return 'playing'
             
             # No matching state found
             detected_state = 'unknown'
@@ -1304,7 +1543,12 @@ class GameDetector:
             elif results['detections']['rule2_select_character']['match']:
                 detected_state = 'select_character'
             elif results['detections']['rule3_playing']['match']:
+                # Playing state detected - check for agent quest button (detection only, no tapping)
                 detected_state = 'playing'
+                quest_button_detected = self._detect_quest_button_only(screenshot)
+                results['detections']['rule3_playing']['quest_button'] = {
+                    'detected': quest_button_detected
+                }
             
             results['detected_state'] = detected_state
             
@@ -1482,230 +1726,6 @@ class GameDetector:
         except Exception as e:
             logger.debug(f"Error detecting state from text: {e}")
             return None
-    
-    def detect_fighting_state(self, screenshot: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Detect if the player is currently fighting/in combat
-        
-        This method should be called after detecting "playing" state to determine
-        if the player is actively fighting or just idle in-game.
-        
-        The main indicator is the auto-hunt button's rotating light ring effect,
-        which appears when auto-hunt is active.
-        
-        Args:
-            screenshot: OpenCV image array (full screenshot)
-            
-        Returns:
-            Tuple of (is_fighting: bool, details: dict) where details contains:
-            - 'auto_hunt_active': bool - Rotating light ring detected on auto-hunt button
-            - 'reason': str - Reason for fighting/not fighting detection
-        """
-        try:
-            details = {
-                'auto_hunt_active': False,
-                'reason': 'unknown'
-            }
-            
-            # Method 1: Check if auto-hunt button has rotating light ring effect
-            # The rotating light ring indicates auto-hunt is active = fighting
-            auto_hunt_active = self._detect_auto_hunt_light_ring(screenshot)
-            if auto_hunt_active:
-                details['auto_hunt_active'] = True
-                details['reason'] = 'auto_hunt_light_ring_active'
-                logger.info("Fighting state detected: Auto-hunt button has rotating light ring (auto-hunt active)")
-                return True, details
-            
-            # Method 2: Check health bar region for damage indicators
-            # Health bar showing damage might indicate recent combat
-            health_bar_region = self._get_region('health_bar')
-            if health_bar_region:
-                x1, y1, x2, y2 = health_bar_region
-                # Ensure coordinates are within screenshot bounds
-                x1 = max(0, min(x1, screenshot.shape[1]))
-                y1 = max(0, min(y1, screenshot.shape[0]))
-                x2 = max(0, min(x2, screenshot.shape[1]))
-                y2 = max(0, min(y2, screenshot.shape[0]))
-                
-                if x2 > x1 and y2 > y1:
-                    health_area = screenshot[y1:y2, x1:x2]
-                    if health_area.size > 0:
-                        # Check if health bar shows damage (not full HP)
-                        # Health bars typically have green (full HP) and red (damage/missing HP)
-                        # Convert to HSV to detect red color (damage indicator)
-                        hsv = _bgr_to_hsv(health_area)
-                        
-                        # Red color in HSV: hue around 0-10 or 170-180, with sufficient saturation
-                        hue = hsv[:, :, 0]
-                        saturation = hsv[:, :, 1]
-                        value = hsv[:, :, 2]
-                        
-                        # Red mask: hue in red range AND sufficient saturation AND brightness
-                        red_mask = ((hue < 10) | (hue > 170)) & (saturation > 50) & (value > 50)
-                        red_pixels = np.sum(red_mask)
-                        total_pixels = health_area.shape[0] * health_area.shape[1]
-                        red_ratio = red_pixels / total_pixels if total_pixels > 0 else 0
-                        
-                        # Also check for green (full health) - if mostly green, probably not taking damage
-                        green_mask = (hue > 50) & (hue < 70) & (saturation > 50) & (value > 50)
-                        green_pixels = np.sum(green_mask)
-                        green_ratio = green_pixels / total_pixels if total_pixels > 0 else 0
-                        
-                        # If significant red is present and not mostly green, might indicate damage
-                        if red_ratio > 0.15 and green_ratio < 0.7:  # 15% red and less than 70% green
-                            details['reason'] = 'health_bar_shows_damage'
-                            logger.info(f"Fighting state detected: Health bar shows damage (red: {red_ratio:.2f}, green: {green_ratio:.2f})")
-                            return True, details
-            
-            # No fighting indicators found
-            details['reason'] = 'no_combat_indicators'
-            logger.debug("No fighting state detected - player appears idle")
-            return False, details
-            
-        except Exception as e:
-            logger.debug(f"Error detecting fighting state: {e}")
-            return False, {'reason': f'error: {str(e)}'}
-    
-    def _detect_auto_hunt_light_ring(self, screenshot: np.ndarray) -> bool:
-        """
-        Detect the rotating light ring effect on the auto-hunt button
-        
-        The auto-hunt button has a rotating light ring effect when active.
-        This effect can be detected by looking for:
-        1. Bright, saturated colors (yellow/orange/white) in a circular pattern
-        2. High brightness variation in the button region
-        3. Specific color patterns that indicate the light ring
-        
-        Args:
-            screenshot: OpenCV image array (full screenshot)
-            
-        Returns:
-            True if rotating light ring is detected (auto-hunt active), False otherwise
-        """
-        try:
-            # Get control_buttons region where auto-hunt button is located
-            control_buttons_region = self._get_region('control_buttons')
-            if not control_buttons_region:
-                logger.debug("control_buttons region not configured - cannot detect auto-hunt light ring")
-                return False
-            
-            x1, y1, x2, y2 = control_buttons_region
-            # Ensure coordinates are within screenshot bounds
-            x1 = max(0, min(x1, screenshot.shape[1]))
-            y1 = max(0, min(y1, screenshot.shape[0]))
-            x2 = max(0, min(x2, screenshot.shape[1]))
-            y2 = max(0, min(y2, screenshot.shape[0]))
-            
-            if x2 <= x1 or y2 <= y1:
-                logger.debug("Invalid control_buttons region coordinates")
-                return False
-            
-            # Extract control buttons region
-            control_area = screenshot[y1:y2, x1:x2]
-            
-            if control_area.size == 0:
-                return False
-            
-            # Try to find auto_hunt_button first to get its position
-            # Then analyze the area around it for the light ring effect
-            search_region = (x1, y1, x2 - x1, y2 - y1)
-            button_result = self.template_matcher.find_template(
-                screenshot,
-                "auto_hunt_button.png",
-                confidence=0.6,  # Lower threshold to find button even with light ring
-                region=search_region,
-                multi_scale=True
-            )
-            
-            if not button_result:
-                logger.debug("Auto-hunt button not found in control_buttons region")
-                return False
-            
-            button_x, button_y, button_confidence = button_result
-            logger.debug(f"Auto-hunt button found at ({button_x}, {button_y}) with confidence {button_confidence:.3f}")
-            
-            # Load template to get button size
-            template = self.template_matcher.load_template("auto_hunt_button.png")
-            if template is None:
-                logger.debug("Could not load auto_hunt_button template")
-                return False
-            
-            template_h, template_w = template.shape[:2]
-            
-            # Calculate button region in screenshot coordinates
-            button_center_x = int(button_x)
-            button_center_y = int(button_y)
-            
-            # Extract a region around the button (larger than button to include light ring)
-            # Light ring typically extends 10-20 pixels beyond the button
-            ring_margin = 25
-            analysis_x1 = max(x1, button_center_x - template_w // 2 - ring_margin)
-            analysis_y1 = max(y1, button_center_y - template_h // 2 - ring_margin)
-            analysis_x2 = min(x2, button_center_x + template_w // 2 + ring_margin)
-            analysis_y2 = min(y2, button_center_y + template_h // 2 + ring_margin)
-            
-            if analysis_x2 <= analysis_x1 or analysis_y2 <= analysis_y1:
-                logger.debug("Invalid button analysis region")
-                return False
-            
-            button_analysis_area = screenshot[analysis_y1:analysis_y2, analysis_x1:analysis_x2]
-            
-            if button_analysis_area.size == 0:
-                return False
-            
-            # Convert to HSV for better color analysis
-            hsv = _bgr_to_hsv(button_analysis_area)
-            hue = hsv[:, :, 0]
-            saturation = hsv[:, :, 1]
-            value = hsv[:, :, 2]
-            
-            # Rotating light ring typically has:
-            # 1. High brightness (value > 200)
-            # 2. High saturation (saturation > 150)
-            # 3. Yellow/orange/white colors (hue around 15-30 for yellow/orange, or low saturation for white)
-            
-            # Detect bright, saturated yellow/orange colors (common in light rings)
-            yellow_orange_mask = (
-                (hue >= 15) & (hue <= 30) &  # Yellow/orange hue range
-                (saturation > 150) &  # High saturation
-                (value > 200)  # High brightness
-            )
-            
-            # Detect bright white/light colors (also common in light rings)
-            white_light_mask = (
-                (saturation < 50) &  # Low saturation (white/gray)
-                (value > 220)  # Very high brightness
-            )
-            
-            # Combine both masks
-            light_ring_mask = yellow_orange_mask | white_light_mask
-            
-            # Count light ring pixels
-            light_pixels = np.sum(light_ring_mask)
-            total_pixels = button_analysis_area.shape[0] * button_analysis_area.shape[1]
-            light_ratio = light_pixels / total_pixels if total_pixels > 0 else 0
-            
-            # Also check for high brightness variation (indicating animated/rotating effect)
-            brightness_std = np.std(value)
-            brightness_mean = np.mean(value)
-            
-            # Rotating light rings typically have:
-            # - Significant bright pixels (light_ratio > 0.05)
-            # - High brightness variation (std > 40) due to rotation
-            # - High average brightness (mean > 150)
-            
-            logger.debug(f"Light ring detection: light_ratio={light_ratio:.3f}, brightness_std={brightness_std:.1f}, brightness_mean={brightness_mean:.1f}")
-            
-            if light_ratio > 0.05 and brightness_std > 40 and brightness_mean > 150:
-                logger.info(f"Rotating light ring detected on auto-hunt button (light_ratio: {light_ratio:.3f}, brightness_std: {brightness_std:.1f})")
-                return True
-            
-            logger.debug("No rotating light ring detected on auto-hunt button")
-            return False
-            
-        except Exception as e:
-            logger.debug(f"Error detecting auto-hunt light ring: {e}")
-            return False
     
     def detect_auto_hunt_in_control_buttons(self, screenshot: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """

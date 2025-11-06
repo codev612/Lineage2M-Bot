@@ -254,13 +254,59 @@ class GameAutomation:
                 
                 if screenshot is not None:
                     logger.info(f"Screenshot captured successfully (shape: {screenshot.shape})")
+                    
+                    # Store previous state before detection
+                    previous_state = self.actual_game_state
+                    
                     # Detect actual game state based on specific element combinations
                     logger.info("Calling detect_game_state_from_screenshot()...")
-                    self.actual_game_state = self.game_detector.detect_game_state_from_screenshot(
+                    detected_state = self.game_detector.detect_game_state_from_screenshot(
                         screenshot, 
                         debug=self.debug_detection
                     )
-                    logger.info(f"Detection complete! Game running state: 'running', Actual game state detected: '{self.actual_game_state}'")
+                    logger.info(f"Detection complete! Game running state: 'running', Detected state: '{detected_state}', Previous state: '{previous_state}'")
+                    
+                    # If we were in auto_questing state, preserve it (don't overwrite with detected state)
+                    # unless detected state is something clearly different (like select_server, select_character)
+                    if previous_state == 'auto_questing':
+                        if detected_state in ['select_server', 'select_character', 'unknown']:
+                            # Only change from auto_questing if we detect a clearly different state
+                            logger.info(f"State changed from 'auto_questing' to '{detected_state}'")
+                            self.actual_game_state = detected_state
+                        else:
+                            # Keep auto_questing state
+                            logger.debug(f"Preserving 'auto_questing' state (detected '{detected_state}' but was in auto_questing)")
+                            self.actual_game_state = 'auto_questing'
+                    else:
+                        # Normal flow - use detected state
+                        self.actual_game_state = detected_state
+                    
+                    logger.info(f"Current game state: '{self.actual_game_state}'")
+                    
+                    # If playing state detected, check for agent quest button and tap it
+                    # But only if we're not already in auto_questing state
+                    if self.actual_game_state == 'playing':
+                        logger.info("Playing state detected - checking for agent quest button...")
+                        button_result = self.game_detector.detect_and_tap_agent_quest_button(screenshot)
+                        if button_result == 'auto_questing':
+                            # Confirm button was tapped - set state to auto_questing
+                            logger.info("Confirm button tapped - setting game state to 'auto_questing'")
+                            self.actual_game_state = 'auto_questing'
+                        elif button_result:
+                            logger.info("Quest button detected and tapped successfully")
+                        else:
+                            logger.debug("Quest button not found or tap failed")
+                    # If already in auto_questing state, don't try to tap quest button
+                    elif self.actual_game_state == 'auto_questing':
+                        logger.debug("Game state is 'auto_questing' - skipping quest button check")
+                    # If unknown state detected, check for common buttons and tap them
+                    elif self.actual_game_state == 'unknown':
+                        logger.info("Unknown state detected - checking for common buttons...")
+                        button_tapped = self.game_detector.detect_and_tap_unknown_state_buttons(screenshot)
+                        if button_tapped:
+                            logger.info("Unknown state button detected and tapped successfully")
+                        else:
+                            logger.debug("No unknown state buttons found or tap failed")
                     
                     # Get detailed detection results for debugging
                     if self.debug_detection:
