@@ -21,6 +21,31 @@ DETAILED_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(linen
 # Logger registry to avoid duplicate handlers
 _loggers = {}
 
+
+class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """
+    RotatingFileHandler that gracefully handles Windows file locking errors.
+    On Windows, when multiple threads try to rotate the log file simultaneously,
+    it can cause PermissionError. This handler catches and ignores those errors.
+    """
+    
+    def doRollover(self):
+        """
+        Override doRollover to handle Windows file locking errors gracefully.
+        """
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            # On Windows, if the file is locked by another process/thread,
+            # just skip the rotation and continue logging to the current file.
+            # This prevents log spam from rotation errors.
+            # The rotation will be attempted again on the next log write.
+            pass
+        except Exception:
+            # For any other unexpected errors, let the parent handle it
+            # but don't let it crash the application
+            self.handleError(None)
+
 def get_logger(name: str, level: str = "INFO", 
                log_file: str = "lineage2m_bot.log",
                console_output: bool = True,
@@ -51,10 +76,10 @@ def get_logger(name: str, level: str = "INFO",
     
     formatter = logging.Formatter(DETAILED_FORMAT if detailed else DEFAULT_FORMAT)
     
-    # File handler with rotation
+    # File handler with rotation (using safe handler for Windows compatibility)
     if log_file:
         log_path = LOGS_DIR / log_file
-        file_handler = logging.handlers.RotatingFileHandler(
+        file_handler = SafeRotatingFileHandler(
             log_path, 
             maxBytes=10*1024*1024,  # 10MB
             backupCount=5

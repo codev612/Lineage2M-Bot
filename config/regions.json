@@ -1,0 +1,202 @@
+{
+  "map_region": [
+    [
+      50,
+      72,
+      336,
+      314
+    ]
+  ],
+  "quests": [
+    [
+      1310,
+      103,
+      1771,
+      458
+    ]
+  ],
+  "control_buttons": [
+    [
+      1360,
+      484,
+      1888,
+      806
+    ]
+  ],
+  "items": [
+    [
+      1305,
+      19,
+      1689,
+      98
+    ]
+  ],
+  "agent_quest_region": [
+    [
+      1732,
+      115,
+      1768,
+      156
+    ]
+  ],
+  "blood_bottle_region": [
+    [
+      604,
+      919,
+      674,
+      1003
+    ]
+  ],
+  "health_bar": [
+    [
+      48,
+      16,
+      333,
+      48
+    ]
+  ],
+  "alert_region": [
+    [
+      50,
+      69,
+      595,
+      612
+    ]
+  ],
+  "short_button_region": [
+    [
+      352,
+      110,
+      410,
+      184
+    ]
+  ],
+  "check_death_penalty": [
+    [
+      724,
+      832,
+      1188,
+      952
+    ]
+  ],
+  "bag_region": [
+    [
+      1502,
+      12,
+      1581,
+      105
+    ]
+  ],
+  "bag_weight_region": [
+    [
+      1507,
+      67,
+      1572,
+      100
+    ]
+  ],
+  "first_village_button_region": [
+    [
+      55,
+      300,
+      511,
+      372
+    ]
+  ],
+  "go_to_village_region": [
+    [
+      424,
+      381,
+      487,
+      441
+    ]
+  ],
+  "village_list_region": [
+    [
+      45,
+      110,
+      518,
+      890
+    ]
+  ],
+  "merchant_button_region": [
+    [
+      348,
+      225,
+      415,
+      290
+    ]
+  ],
+  "blood_bottle_number_region": [
+    [
+      626,
+      972,
+      683,
+      998
+    ]
+  ],
+  "merchant_list_region": [
+    [
+      51,
+      118,
+      339,
+      503
+    ]
+  ],
+  "gludin_village_button_region": [
+    [
+      31,
+      343,
+      432,
+      429
+    ]
+  ],
+  "village_teleport_region": [
+    [
+      1456,
+      691,
+      1850,
+      753
+    ]
+  ],
+  "village_list": [
+    [
+      57,
+      326,
+      477,
+      888
+    ]
+  ],
+  "purchase_list_region": [
+    [
+      67,
+      261,
+      506,
+      883
+    ]
+  ],
+  "estimated_weight_region": [
+    [
+      1224,
+      708,
+      1348,
+      760
+    ]
+  ],
+  "player": [
+    [
+      864,
+      482,
+      1084,
+      933
+    ]
+  ],
+  "purchase_number_100_region": [
+    [
+      708,
+      945,
+      816,
+      1015
+    ]
+  ]
+}

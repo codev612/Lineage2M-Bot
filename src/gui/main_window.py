@@ -57,6 +57,9 @@ class MainWindow(GUIEventHandlers):
         self.devices_list = []
         self.selected_device = None
         
+        # Store game automation objects per device for accessing player parameters
+        self.device_game_automations = {}  # device_id -> GameAutomation instance
+        
         # Threading
         self.message_queue = queue.Queue()
         # Limit screenshot queue to prevent memory buildup (max 1 screenshot to minimize memory)
@@ -458,12 +461,31 @@ class MainWindow(GUIEventHandlers):
         )
         game_state_label.pack(fill="x", padx=5, pady=2)
         
+        # Player parameters labels
+        blood_bottle_label = ctk.CTkLabel(
+            state_frame,
+            text="🩸 Blood Bottle: --",
+            font=ctk.CTkFont(size=11),
+            anchor="w"
+        )
+        blood_bottle_label.pack(fill="x", padx=5, pady=2)
+        
+        bag_weight_label = ctk.CTkLabel(
+            state_frame,
+            text="🎒 Bag Weight: --",
+            font=ctk.CTkFont(size=11),
+            anchor="w"
+        )
+        bag_weight_label.pack(fill="x", padx=5, pady=2)
+        
         # Store widget references for later updates
         self.device_control_widgets[device_id] = {
             'frame': device_frame,
             'status_label': status_label,
             'bot_state_label': bot_state_label,
             'game_state_label': game_state_label,
+            'blood_bottle_label': blood_bottle_label,
+            'bag_weight_label': bag_weight_label,
             'start_btn': start_btn,
             'stop_btn': stop_btn,
             'screenshot_btn': screenshot_btn,
@@ -1394,13 +1416,8 @@ unavailable.
             messagebox.showwarning("No Canvas", "Canvas not initialized.")
             return
         
-        # Get device ID if available for per-device regions
-        device_id = self.region_device_var.get() if hasattr(self, 'region_device_var') else None
-        if device_id and device_id != "Select device...":
-            # Use device-specific filename
-            default_filename = f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
-        else:
-            default_filename = "regions.json"
+        # Always use shared regions.json file (shared across all devices)
+        default_filename = "regions.json"
         
         # Ensure config directory exists
         config_dir = Path("config")
@@ -1474,21 +1491,8 @@ unavailable.
     def _load_custom_region_types_from_files(self):
         """Load custom region types from JSON files and add them to the UI"""
         try:
-            # Determine which JSON file to check
-            device_id = None
-            if hasattr(self, 'region_device_var'):
-                device_id = self.region_device_var.get()
-            
-            if device_id and device_id != "Select device...":
-                # Check device-specific file
-                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
-            else:
-                # Check default file
-                regions_file = Path("config/regions.json")
-            
-            # Also check default file if device-specific doesn't exist
-            if not regions_file.exists():
-                regions_file = Path("config/regions.json")
+            # Always use shared regions.json file (shared across all devices)
+            regions_file = Path("config/regions.json")
             
             # Load region types from JSON file
             if regions_file.exists():
@@ -1566,17 +1570,8 @@ unavailable.
             return
         
         try:
-            # Determine which JSON file to load
-            device_id = None
-            if hasattr(self, 'region_device_var'):
-                device_id = self.region_device_var.get()
-            
-            if device_id and device_id != "Select device...":
-                # Load device-specific file
-                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
-            else:
-                # Load default file
-                regions_file = Path("config/regions.json")
+            # Always use shared regions.json file (shared across all devices)
+            regions_file = Path("config/regions.json")
             
             # Load regions if file exists
             if regions_file.exists():
@@ -1594,17 +1589,8 @@ unavailable.
             return
         
         try:
-            # Determine which JSON file to check
-            device_id = None
-            if hasattr(self, 'region_device_var'):
-                device_id = self.region_device_var.get()
-            
-            if device_id and device_id != "Select device...":
-                # Check device-specific file
-                regions_file = Path("config") / f"regions_{device_id.replace(':', '_').replace('.', '_')}.json"
-            else:
-                # Check default file
-                regions_file = Path("config/regions.json")
+            # Always use shared regions.json file (shared across all devices)
+            regions_file = Path("config/regions.json")
             
             # Load regions if file exists
             saved_regions = {}
@@ -1981,6 +1967,39 @@ This is a test message.
                             game_status_text = game_status_text[1:].strip()
                         
                         widgets['game_state_label'].configure(text=f"🎮 Game: {game_status_text}")
+                    
+                    # Update player parameters labels
+                    if device_id in self.device_game_automations:
+                        try:
+                            game_automation = self.device_game_automations[device_id]
+                            player_params = game_automation.get_player_parameters()
+                            
+                            # Update blood bottle label
+                            if 'blood_bottle_label' in widgets and widgets['blood_bottle_label'].winfo_exists():
+                                blood_bottle = player_params.get('blood_bottle', '--')
+                                if blood_bottle is None:
+                                    blood_bottle = '--'
+                                widgets['blood_bottle_label'].configure(text=f"🩸 Blood Bottle: {blood_bottle}")
+                            
+                            # Update bag weight label
+                            if 'bag_weight_label' in widgets and widgets['bag_weight_label'].winfo_exists():
+                                bag_weight = player_params.get('bag_weight', '--')
+                                if bag_weight is None:
+                                    bag_weight = '--'
+                                widgets['bag_weight_label'].configure(text=f"🎒 Bag Weight: {bag_weight}")
+                        except Exception as e:
+                            logger.debug(f"Error updating player parameters for {device_id}: {e}")
+                            # Set to default if error
+                            if 'blood_bottle_label' in widgets and widgets['blood_bottle_label'].winfo_exists():
+                                widgets['blood_bottle_label'].configure(text="🩸 Blood Bottle: --")
+                            if 'bag_weight_label' in widgets and widgets['bag_weight_label'].winfo_exists():
+                                widgets['bag_weight_label'].configure(text="🎒 Bag Weight: --")
+                    else:
+                        # No game automation available, show defaults
+                        if 'blood_bottle_label' in widgets and widgets['blood_bottle_label'].winfo_exists():
+                            widgets['blood_bottle_label'].configure(text="🩸 Blood Bottle: --")
+                        if 'bag_weight_label' in widgets and widgets['bag_weight_label'].winfo_exists():
+                            widgets['bag_weight_label'].configure(text="🎒 Bag Weight: --")
         except Exception as e:
             logger.error(f"Error updating device states: {e}", exc_info=True)
     

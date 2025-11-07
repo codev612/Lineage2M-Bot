@@ -126,10 +126,40 @@ class RegionCanvas:
                 # PhotoImage will be released when canvas deletes the image
                 self.screenshot_image = None
             
-            # Convert BGR to RGB
-            if len(screenshot.shape) == 3:
-                rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
+            # Convert BGR to RGB for display (PIL/Tkinter expects RGB)
+            # OpenCV images are in BGR format, but we need RGB for display
+            # take_screenshot() should always return BGR format, so we convert BGR -> RGB
+            if len(screenshot.shape) == 3 and screenshot.shape[2] == 3:
+                # Convert BGR to RGB for display
+                try:
+                    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGR2RGB'):
+                        rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
+                        logger.debug("Converted BGR to RGB using cv2.cvtColor")
+                    else:
+                        # Manual BGR to RGB conversion using numpy (reverse channel order)
+                        rgb_image = screenshot[:, :, ::-1]  # Reverse channels: BGR -> RGB
+                        logger.debug("Converted BGR to RGB using manual numpy conversion")
+                except Exception as e:
+                    logger.warning(f"Error converting BGR to RGB with cv2, trying manual conversion: {e}")
+                    # Fallback: manual conversion (reverse channel order)
+                    rgb_image = screenshot[:, :, ::-1]  # Reverse channels: BGR -> RGB
+                    logger.debug("Used fallback manual BGR to RGB conversion")
+            elif len(screenshot.shape) == 3 and screenshot.shape[2] == 4:
+                # RGBA image - convert to RGB
+                try:
+                    if hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_BGRA2RGB'):
+                        rgb_image = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2RGB)
+                    elif hasattr(cv2, 'cvtColor') and hasattr(cv2, 'COLOR_RGBA2RGB'):
+                        # If already RGBA, just drop alpha
+                        rgb_image = screenshot[:, :, :3]
+                    else:
+                        # Manual: drop alpha and reverse if BGRA
+                        rgb_image = screenshot[:, :, :3][:, :, ::-1]  # Drop alpha, reverse BGR->RGB
+                except Exception as e:
+                    logger.warning(f"Error converting BGRA to RGB: {e}")
+                    rgb_image = screenshot[:, :, :3][:, :, ::-1]  # Drop alpha, reverse BGR->RGB
             else:
+                # Grayscale or other format
                 rgb_image = screenshot
             
             # Store original numpy array (more memory efficient than PIL)

@@ -1314,6 +1314,9 @@ class GUIEventHandlers:
                     game_automation = GameAutomation(adb_manager, game_detector, device_id=device_id)
                     game_automation.start()
                     
+                    # Store game automation for accessing player parameters
+                    self.device_game_automations[device_id] = game_automation
+                    
                     logger.info(f"Game automation initialized for device {device_id}")
                     
                 except Exception as e:
@@ -1353,11 +1356,18 @@ class GUIEventHandlers:
                                     if current_bot_state and not current_bot_state.bot_state.is_running:
                                         device_state_monitor.update_bot_state(device_id, True, "Waiting for server selection")
                                 
+                                # Get current game state to preserve actual_game_state and detailed_game_state
+                                current_state = device_state_monitor.get_device_state(device_id)
+                                current_actual = current_state.game_state.actual_game_state if current_state else None
+                                current_detailed = current_state.game_state.detailed_game_state if current_state else None
+                                
                                 device_state_monitor.update_game_state(
                                     device_id,
                                     is_running=True,
                                     package_name=package,
-                                    game_state=game_state_str
+                                    game_state=game_state_str,
+                                    actual_game_state=current_actual,
+                                    detailed_game_state=current_detailed
                                 )
                             else:
                                 logger.debug(f"Device {device_id} - Game not detected as running")
@@ -1388,11 +1398,18 @@ class GUIEventHandlers:
                                                 logger.debug(f"Error checking tap screen text: {e}")
                                                 game_state_str = 'detected'
                                             
+                                            # Get current game state to preserve actual_game_state and detailed_game_state
+                                            current_state = device_state_monitor.get_device_state(device_id)
+                                            current_actual = current_state.game_state.actual_game_state if current_state else None
+                                            current_detailed = current_state.game_state.detailed_game_state if current_state else None
+                                            
                                             device_state_monitor.update_game_state(
                                                 device_id,
                                                 is_running=True,
                                                 package_name=running_packages[0],
-                                                game_state=game_state_str
+                                                game_state=game_state_str,
+                                                actual_game_state=current_actual,
+                                                detailed_game_state=current_detailed
                                             )
                                 except Exception as e:
                                     logger.debug(f"Error checking game status via check_game_status: {e}")
@@ -1401,10 +1418,21 @@ class GUIEventHandlers:
                             game_automation.run_game_loop()
                             
                             # Update bot state with last action
-                            current_game_state = game_automation.current_state
-                            if current_game_state == 'in_game':
+                            game_state = game_automation.get_game_state()
+                            current_game_state = game_state.get('actual_game_state', 'unknown')
+                            detailed_game_state = game_state.get('detailed_game_state', 'unknown')
+                            
+                            # Update device state monitor with actual_game_state and detailed_game_state
+                            device_state_monitor.update_game_state(
+                                device_id,
+                                is_running=True,
+                                actual_game_state=current_game_state,
+                                detailed_game_state=detailed_game_state
+                            )
+                            
+                            if current_game_state == 'playing':
                                 device_state_monitor.update_bot_state(device_id, True, "Playing")
-                            elif current_game_state == 'main_menu':
+                            elif current_game_state in ['select_server', 'select_character']:
                                 device_state_monitor.update_bot_state(device_id, True, "In Menu")
                             else:
                                 device_state_monitor.update_bot_state(device_id, True, "Monitoring")
@@ -1443,6 +1471,10 @@ class GUIEventHandlers:
                     try:
                         game_automation.stop()
                         logger.info(f"Game automation stopped for device {device_id}")
+                        
+                        # Remove game automation from storage
+                        if device_id in self.device_game_automations:
+                            del self.device_game_automations[device_id]
                     except Exception as e:
                         logger.error(f"Error stopping game automation: {e}")
                 

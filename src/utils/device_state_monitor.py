@@ -31,6 +31,8 @@ class GamePlayingState:
     is_running: bool = False
     package_name: Optional[str] = None
     game_state: str = "unknown"  # in_game, main_menu, loading_screen, etc.
+    actual_game_state: Optional[str] = None  # Actual game state: 'select_server', 'select_character', 'playing', 'unknown', etc.
+    detailed_game_state: Optional[str] = None  # Detailed game state: 'auto_questing', 'purchasing', 'quest_ended', etc.
     last_detected: Optional[datetime] = None
     state_changes: int = 0
     last_action: Optional[str] = None  # auto_attack, collect, potion, etc.
@@ -114,6 +116,8 @@ class DeviceStateMonitor:
                          is_running: bool = None,
                          package_name: str = None,
                          game_state: str = None,
+                         actual_game_state: str = None,
+                         detailed_game_state: str = None,
                          action: str = None,
                          health_status: str = None,
                          detected_items: int = None,
@@ -139,6 +143,15 @@ class DeviceStateMonitor:
                 if game_state != game_state_obj.game_state:
                     game_state_obj.state_changes += 1
                 game_state_obj.game_state = game_state
+            
+            # Always update actual_game_state and detailed_game_state if provided (including 'unknown')
+            if actual_game_state is not None:
+                game_state_obj.actual_game_state = actual_game_state
+            # If not provided but we want to keep existing value, don't change it
+            
+            if detailed_game_state is not None:
+                game_state_obj.detailed_game_state = detailed_game_state
+            # If not provided but we want to keep existing value, don't change it
             
             if action:
                 game_state_obj.last_action = action
@@ -266,6 +279,11 @@ class DeviceStateMonitor:
                 # Show short package name (last part after .)
                 package_short = state.game_state.package_name.split('.')[-1]
                 game_status += f" ({package_short})"
+            # Show actual_game_state and detailed_game_state (always show if available)
+            if state.game_state.actual_game_state:
+                game_status += f" | Actual: {state.game_state.actual_game_state}"
+            if state.game_state.detailed_game_state:
+                game_status += f" | Detailed: {state.game_state.detailed_game_state}"
             if state.game_state.game_state and state.game_state.game_state != 'unknown':
                 game_status += f" | State: {state.game_state.game_state}"
             if state.game_state.last_action:
@@ -293,6 +311,8 @@ class DeviceStateMonitor:
             'bot_running': state.bot_state.is_running,
             'game_running': state.game_state.is_running,
             'game_state': state.game_state.game_state,
+            'actual_game_state': state.game_state.actual_game_state,
+            'detailed_game_state': state.game_state.detailed_game_state,
             'last_action': state.bot_state.last_action,
             'error_count': state.bot_state.error_count,
             'action_counts': state.game_state.action_count.copy()
