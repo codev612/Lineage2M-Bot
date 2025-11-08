@@ -207,6 +207,7 @@ class RegionCanvas:
         """Set the current region type for drawing"""
         self.current_region_type = region_type
         logger.debug(f"Region type set to: {region_type}")
+        self._highlight_selected_region()
     
     def _on_button_press(self, event):
         """Handle mouse button press - start drawing rectangle"""
@@ -290,6 +291,7 @@ class RegionCanvas:
         """Redraw all regions on the canvas"""
         # Clear existing region rectangles
         self.canvas.delete("region")
+        self.canvas.delete("highlight")
         
         if not hasattr(self, 'scale'):
             return
@@ -322,6 +324,36 @@ class RegionCanvas:
                     font=("Arial", 10, "bold"),
                     tags="region"
                 )
+
+        # Highlight the currently selected region type, if any
+        self._highlight_selected_region()
+
+    def _highlight_selected_region(self):
+        """Highlight regions of the currently selected type with a black outline."""
+        self.canvas.delete("highlight")
+
+        if not hasattr(self, 'scale'):
+            return
+
+        if not self.current_region_type:
+            return
+
+        region_list = self.regions.get(self.current_region_type)
+        if not region_list:
+            return
+
+        for x1, y1, x2, y2 in region_list:
+            scaled_x1 = x1 * self.scale
+            scaled_y1 = y1 * self.scale
+            scaled_x2 = x2 * self.scale
+            scaled_y2 = y2 * self.scale
+
+            self.canvas.create_rectangle(
+                scaled_x1, scaled_y1, scaled_x2, scaled_y2,
+                outline='#000000',
+                width=3,
+                tags="highlight"
+            )
     
     def clear_region(self, region_type: str):
         """Clear all regions of a specific type"""

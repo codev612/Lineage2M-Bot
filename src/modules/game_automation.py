@@ -30,6 +30,8 @@ logger = get_logger(__name__)
 # Constants
 DEFAULT_SCREEN_TRANSITION_TIME = 10.0  # Default time to wait for screen transitions (seconds)
 MAX_RETRY_COUNT = 10  # Maximum number of retries for each step before stopping bot
+GO_TO_VILLAGE_BLOOD_BOTTLE_LIMIT = 100
+PURCHASING_TIMEOUT_THRESHOLD = 300
 
 
 class GameAutomation:
@@ -313,13 +315,25 @@ class GameAutomation:
                     )
                     logger.info(f"Detection complete! Game running state: 'running', Detected state: '{detected_state}', Previous state: '{previous_state}'")
                     
-                    # Update actual_game_state (restricted to: select_server, select_character, playing, unknown)
+                    # Update actual_game_state (restricted to: select_server, select_character, playing, screen_lock, claim_reward, accepting_reward, opened_dialogue, confirming_tips, confirming_tips_window, accept_button, unknown)
                     # detailed_game_state is independent and won't be reset automatically
-                    valid_states = ['select_server', 'select_character', 'playing', 'unknown']
+                    valid_states = ['select_server', 'select_character', 'playing', 'screen_lock', 'claim_reward', 'accepting_reward', 'opened_dialogue', 'confirming_tips', 'confirming_tips_window', 'confirming_tips_window_partial', 'accept_button', 'unknown']
                     if detected_state not in valid_states:
                         # If detected state is not in valid list, default to 'unknown'
                         logger.warning(f"Invalid detected state '{detected_state}', defaulting to 'unknown'")
                         detected_state = 'unknown'
+
+                    if detected_state == 'unknown' and (
+                        previous_state == 'playing' or self.game_detector.has_entered_playing_state()
+                    ):
+                        logger.info("Detection returned 'unknown' but playing was already established; keeping 'playing'.")
+                        detected_state = 'playing'
+                    
+                    # Check for detected detailed game state (e.g., 'teleporting')
+                    detected_detailed_state = self.game_detector.get_detected_detailed_state()
+                    if detected_detailed_state:
+                        logger.info(f"Detected detailed game state: '{detected_detailed_state}' - updating detailed_game_state")
+                        self._update_game_state({'detailed_game_state': detected_detailed_state})
                     
                     # Update only actual_game_state, keep detailed_game_state unchanged
                     self._update_game_state({
@@ -331,6 +345,62 @@ class GameAutomation:
                     # If playing state detected, check for agent quest button and tap it
                     # But only if detailed_game_state is not 'auto_questing'
                     if self.game_state['actual_game_state'] == 'playing':
+                        quest_action_taken = False
+                        # Check for teleporting detailed state (Rule 10 handles extraction and tapping)
+                        if self.game_state['detailed_game_state'] == 'teleporting':
+                            logger.info("Teleporting state detected - Rule 10 has already handled price comparison and button tapping")
+                        # Check for dead state (Rule 11 handles resurrect button tapping)
+                        elif self.game_state['detailed_game_state'] == 'dead':
+                            logger.info("Dead state detected - Rule 11 has already handled resurrect button tapping")
+                        # Rule 12: Handle purchasing state (Rule 11 sets this after tapping resurrect button)
+                        elif self.game_state['detailed_game_state'] == 'purchasing':
+                            last_purchasing = getattr(self, '_last_purchasing_timestamp', None)
+                            now_ts = time.time()
+                            purchasing_timeout_triggered = False
+
+                            if last_purchasing:
+                                elapsed = now_ts - last_purchasing
+                                if elapsed > PURCHASING_TIMEOUT_THRESHOLD:
+                                    logger.warning(
+                                        "Purchasing state persisted for more than 5 minutes - forcing fallback to auto questing"
+                                    )
+                                    self._update_game_state({'detailed_game_state': 'auto_questing'})
+                                    quest_tapped = self.game_detector.detect_and_tap_agent_quest_button(screenshot)
+                                    if quest_tapped == 'auto_questing':
+                                        logger.info("Quest button tapped from purchasing timeout fallback")
+                                        self._update_game_state({'detailed_game_state': 'auto_questing'})
+                                    self._last_purchasing_timestamp = None
+                                    purchasing_timeout_triggered = True
+                            else:
+                                self._last_purchasing_timestamp = now_ts
+
+                            if not purchasing_timeout_triggered:
+                                logger.info("Rule 12: Purchasing state detected - starting purchasing flow...")
+                                self._handle_complete_purchasing_flow()
+                        # Rule 13: Handle going to village state (when blood bottle is low)
+                        elif self.game_state['detailed_game_state'] == 'going_to_village':
+                            logger.info("Rule 13: Going to village state detected - starting go to village flow...")
+                            self._handle_go_to_village_flow()
+                        # Handle unknown detailed_game_state (quest detection)
+                        elif self.game_state['detailed_game_state'] == 'unknown':
+                            quest_action_taken = False
+                            quest_matches = self.game_detector.detect_quests_in_region(screenshot)
+                            if quest_matches:
+                                top_match = quest_matches[0]
+                                top_x, top_y, top_confidence, _ = top_match
+                                logger.info(f"Quest button detected in quests region at ({top_x}, {top_y}) with confidence {top_confidence:.3f} - tapping topmost entry.")
+                                if self.adb and hasattr(self.adb, 'tap'):
+                                    quest_action_taken = bool(self.adb.tap(int(top_x), int(top_y)))
+                                    if quest_action_taken:
+                                        logger.info("Successfully tapped top quest button in quests region")
+                                    else:
+                                        logger.warning("Failed to tap top quest button in quests region")
+                                else:
+                                    logger.warning("ADB manager not available or tap method not found for quest button tap")
+                            else:
+                                logger.info("No quest buttons detected in quests region - tapping agent quest region center.")
+                                quest_action_taken = self.game_detector.tap_agent_quest_region_center(screenshot)
+
                         # Take a fresh screenshot for player parameter detection to ensure accuracy
                         param_screenshot = self.adb.take_screenshot()
                         if param_screenshot is None:
@@ -361,26 +431,22 @@ class GameAutomation:
                             
                             logger.info(f"Player parameters updated: {self.player_parameters}")
                             
-                        
-                        # Check blood bottle - only tap quest button if blood bottle is more than 100
+                        # Rule 13: Check if blood bottle is below low limit (100) when in auto_questing state
                         blood_bottle = self.player_parameters.get('blood_bottle')
+                        blood_bottle_num: Optional[int] = None
                         blood_bottle_sufficient = False
-                        
-                        if blood_bottle is None:
-                            blood_bottle_sufficient = False
-                        elif blood_bottle == '0':
-                            blood_bottle_sufficient = False
-                        else:
+
+                        if blood_bottle is not None:
                             try:
                                 blood_bottle_num = int(blood_bottle)
-                                if blood_bottle_num > 100:
-                                    blood_bottle_sufficient = True
                             except (ValueError, TypeError):
-                                blood_bottle_sufficient = False
-                        
-                        # Only tap quest button if blood bottle is more than 100
+                                blood_bottle_num = None
+
+                        if blood_bottle_num is not None and blood_bottle_num > 100:
+                            blood_bottle_sufficient = True
+
                         if blood_bottle_sufficient:
-                            if self.game_state['detailed_game_state'] != 'auto_questing':
+                            if self.game_state['detailed_game_state'] != 'auto_questing' and not quest_action_taken:
                                 logger.info("Playing state detected and detailed_game_state is not 'auto_questing' - checking for agent quest button...")
                                 button_result = self.game_detector.detect_and_tap_agent_quest_button(screenshot)
                                 if button_result == 'auto_questing':
@@ -431,12 +497,234 @@ class GameAutomation:
                                     logger.warning("ADB manager not available or tap method not found")
                             else:
                                 logger.info("Enter button not detected in select_character state")
-                    # If unknown state detected, check for common buttons and tap them
+                    # If screen_lock state detected, swipe the unlock screen region
+                    elif self.game_state['actual_game_state'] == 'screen_lock':
+                        logger.info("Screen lock state detected - swiping unlock screen region...")
+                        if screenshot is not None:
+                            swipe_success = self.game_detector._detect_and_swipe_unlock_screen(screenshot)
+                            if swipe_success:
+                                logger.info("Successfully swiped unlock screen region")
+                            else:
+                                logger.warning("Failed to swipe unlock screen region")
+                    # If claim_reward state detected, tap center of claim_reward_button_region (Claim text already detected)
+                    elif self.game_state['actual_game_state'] == 'claim_reward':
+                        logger.info("Claim reward state detected - tapping center of claim_reward_button_region...")
+                        if screenshot is not None:
+                            claim_reward_region = self.game_detector._get_region('claim_reward_button_region')
+                            if claim_reward_region:
+                                x1, y1, x2, y2 = claim_reward_region
+                                screen_width = screenshot.shape[1]
+                                screen_height = screenshot.shape[0]
+                                x1 = max(0, min(x1, screen_width))
+                                y1 = max(0, min(y1, screen_height))
+                                x2 = max(0, min(x2, screen_width))
+                                y2 = max(0, min(y2, screen_height))
+                                
+                                if x2 > x1 and y2 > y1:
+                                    # Tap the center of the region
+                                    tap_x = (x1 + x2) // 2
+                                    tap_y = (y1 + y2) // 2
+                                    logger.info(f"Tapping claim reward button region center at ({tap_x}, {tap_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(tap_x), int(tap_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped claim reward button at ({tap_x}, {tap_y})")
+                                        else:
+                                            logger.warning(f"Failed to tap claim reward button at ({tap_x}, {tap_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning("Invalid claim_reward_button_region coordinates")
+                            else:
+                                logger.warning("claim_reward_button_region not configured")
+                    # If accepting_reward state detected, tap center of reward_accept_button_region (Accept text already detected)
+                    elif self.game_state['actual_game_state'] == 'accepting_reward':
+                        logger.info("Accepting reward state detected - tapping center of reward_accept_button_region...")
+                        if screenshot is not None:
+                            reward_accept_region = self.game_detector._get_region('reward_accept_button_region')
+                            if reward_accept_region:
+                                x1, y1, x2, y2 = reward_accept_region
+                                screen_width = screenshot.shape[1]
+                                screen_height = screenshot.shape[0]
+                                x1 = max(0, min(x1, screen_width))
+                                y1 = max(0, min(y1, screen_height))
+                                x2 = max(0, min(x2, screen_width))
+                                y2 = max(0, min(y2, screen_height))
+                                
+                                if x2 > x1 and y2 > y1:
+                                    # Tap the center of the region
+                                    tap_x = (x1 + x2) // 2
+                                    tap_y = (y1 + y2) // 2
+                                    logger.info(f"Tapping reward accept button region center at ({tap_x}, {tap_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(tap_x), int(tap_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped reward accept button at ({tap_x}, {tap_y})")
+                                        else:
+                                            logger.warning(f"Failed to tap reward accept button at ({tap_x}, {tap_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning("Invalid reward_accept_button_region coordinates")
+                            else:
+                                logger.warning("reward_accept_button_region not configured")
+                    # If opened_dialogue state detected, tap close_cross.png
+                    elif self.game_state['actual_game_state'] == 'opened_dialogue':
+                        logger.info("Opened dialogue state detected - detecting and tapping close_cross.png...")
+                        if screenshot is not None:
+                            close_cross_result = self.game_detector.template_matcher.find_template(
+                                screenshot,
+                                "close_cross.png",
+                                multi_scale=True,
+                                confidence=0.9
+                            )
+                            
+                            if close_cross_result:
+                                x, y, confidence = close_cross_result
+                                logger.info(f"Close cross detected at ({x}, {y}) with confidence {confidence:.3f}")
+                                if self.adb and hasattr(self.adb, 'tap'):
+                                    success = self.adb.tap(int(x), int(y))
+                                    if success:
+                                        logger.info(f"Successfully tapped close cross at ({x}, {y})")
+                                    else:
+                                        logger.warning(f"Failed to tap close cross at ({x}, {y})")
+                                else:
+                                    logger.warning("ADB manager not available or tap method not found")
+                            else:
+                                logger.info("Close cross not detected in opened_dialogue state")
+                    # If confirming_tips state detected, tap do_not_show_again first, then tap confirm
+                    elif self.game_state['actual_game_state'] == 'confirming_tips':
+                        logger.info("Confirming tips state detected - tapping 'Do not show again' first, then 'confirm'...")
+                        if screenshot is not None:
+                            # Get regions from config
+                            do_not_show_region = self.game_detector._get_region('do_not_show_again_region')
+                            tip_confirm_region = self.game_detector._get_region('tip_joining_confirm_region')
+                            
+                            # First, tap do_not_show_again_region
+                            if do_not_show_region:
+                                x1, y1, x2, y2 = do_not_show_region
+                                tap_x = (x1 + x2) // 2
+                                tap_y = (y1 + y2) // 2
+                                
+                                if 0 <= tap_x < screenshot.shape[1] and 0 <= tap_y < screenshot.shape[0]:
+                                    logger.info(f"Tapping 'Do not show again' at ({tap_x}, {tap_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(tap_x), int(tap_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped 'Do not show again' at ({tap_x}, {tap_y})")
+                                            # Wait a bit before tapping confirm
+                                            time.sleep(0.5)
+                                        else:
+                                            logger.warning(f"Failed to tap 'Do not show again' at ({tap_x}, {tap_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning(f"Invalid do_not_show_again_region coordinates: ({tap_x}, {tap_y})")
+                            else:
+                                logger.warning("do_not_show_again_region not configured")
+                            
+                            # Then, tap tip_joining_confirm_region
+                            if tip_confirm_region:
+                                x1, y1, x2, y2 = tip_confirm_region
+                                tap_x = (x1 + x2) // 2
+                                tap_y = (y1 + y2) // 2
+                                
+                                if 0 <= tap_x < screenshot.shape[1] and 0 <= tap_y < screenshot.shape[0]:
+                                    logger.info(f"Tapping 'confirm' at ({tap_x}, {tap_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(tap_x), int(tap_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped 'confirm' at ({tap_x}, {tap_y})")
+                                        else:
+                                            logger.warning(f"Failed to tap 'confirm' at ({tap_x}, {tap_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning(f"Invalid tip_joining_confirm_region coordinates: ({tap_x}, {tap_y})")
+                            else:
+                                logger.warning("tip_joining_confirm_region not configured")
+                    # Rule 14 & 16: Handle confirming_tips_window states
+                    elif self.game_state['actual_game_state'] in ('confirming_tips_window', 'confirming_tips_window_partial'):
+                        logger.info("Rule 14/16: Tip window state detected - tapping 'Do not show again' first, then 'confirm' in tip_window_region...")
+                        if screenshot is not None:
+                            # Get stored positions from game_detector
+                            do_not_show_pos = self.game_detector._tip_window_do_not_show_pos
+                            confirm_pos = self.game_detector._tip_window_confirm_pos
+                            
+                            if do_not_show_pos and confirm_pos:
+                                # First, tap "Do not show again"
+                                do_not_show_x, do_not_show_y = do_not_show_pos
+                                if 0 <= do_not_show_x < screenshot.shape[1] and 0 <= do_not_show_y < screenshot.shape[0]:
+                                    logger.info(f"Tapping 'Do not show again' at ({do_not_show_x}, {do_not_show_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(do_not_show_x), int(do_not_show_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped 'Do not show again' at ({do_not_show_x}, {do_not_show_y})")
+                                            # Wait a bit before tapping confirm
+                                            time.sleep(0.5)
+                                        else:
+                                            logger.warning(f"Failed to tap 'Do not show again' at ({do_not_show_x}, {do_not_show_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning(f"Invalid 'Do not show again' position: ({do_not_show_x}, {do_not_show_y})")
+                                
+                                # Then, tap "confirm"
+                                confirm_x, confirm_y = confirm_pos
+                                if 0 <= confirm_x < screenshot.shape[1] and 0 <= confirm_y < screenshot.shape[0]:
+                                    logger.info(f"Tapping 'confirm' at ({confirm_x}, {confirm_y})")
+                                    if self.adb and hasattr(self.adb, 'tap'):
+                                        success = self.adb.tap(int(confirm_x), int(confirm_y))
+                                        if success:
+                                            logger.info(f"Successfully tapped 'confirm' at ({confirm_x}, {confirm_y})")
+                                        else:
+                                            logger.warning(f"Failed to tap 'confirm' at ({confirm_x}, {confirm_y})")
+                                    else:
+                                        logger.warning("ADB manager not available or tap method not found")
+                                else:
+                                    logger.warning(f"Invalid 'confirm' position: ({confirm_x}, {confirm_y})")
+                            else:
+                                logger.warning("Tip window positions not available - cannot tap buttons")
+                    # Rule 15: If accept_button state detected, tap accept button detected via OCR
+                    elif self.game_state['actual_game_state'] == 'accept_button':
+                        logger.info("Rule 15: accept_button state detected - tapping 'Accept' in source_accept_button_region...")
+                        tap_position = getattr(self.game_detector, '_source_accept_button_pos', None)
+
+                        if tap_position is None:
+                            # Fallback: compute center of configured region
+                            source_accept_region = self.game_detector._get_region('source_accept_button_region')
+                            if source_accept_region:
+                                x1, y1, x2, y2 = source_accept_region
+                                if screenshot is not None:
+                                    screen_width = screenshot.shape[1]
+                                    screen_height = screenshot.shape[0]
+                                    x1 = max(0, min(x1, screen_width))
+                                    y1 = max(0, min(y1, screen_height))
+                                    x2 = max(0, min(x2, screen_width))
+                                    y2 = max(0, min(y2, screen_height))
+                                if x2 > x1 and y2 > y1:
+                                    tap_position = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+                        if tap_position and screenshot is not None:
+                            tap_x, tap_y = tap_position
+                            if 0 <= tap_x < screenshot.shape[1] and 0 <= tap_y < screenshot.shape[0]:
+                                if self.adb and hasattr(self.adb, 'tap'):
+                                    success = self.adb.tap(int(tap_x), int(tap_y))
+                                    if success:
+                                        logger.info(f"Successfully tapped Accept button at ({tap_x}, {tap_y})")
+                                    else:
+                                        logger.warning(f"Failed to tap Accept button at ({tap_x}, {tap_y})")
+                                else:
+                                    logger.warning("ADB manager not available or tap method not found")
+                            else:
+                                logger.warning(f"Accept button tap position out of bounds: ({tap_x}, {tap_y})")
+                        else:
+                            logger.warning("Accept button position not available - cannot tap")
+                    # Rule 17: If claim_button state detected, tap claim button detected via OCR
+                    elif self.game_state['actual_game_state'] == 'claim_button':
+                        logger.info("Rule 17: claim_button state detected - detector already tapped the Claim button")
                     elif self.game_state['actual_game_state'] == 'unknown':
-                        logger.info("Unknown state detected - checking for common buttons...")
-                        button_tapped = self.game_detector.detect_and_tap_unknown_state_buttons(screenshot)
-                        if button_tapped:
-                            logger.info("Unknown state button detected and tapped successfully")
+                        logger.info("Unknown state detected - automated recovery is disabled.")
                     
                     # Get detailed detection results for debugging
                     if self.debug_detection:
@@ -687,7 +975,7 @@ class GameAutomation:
                             else:
                                 logger.warning(f"Failed to tap General Merchant at ({abs_x}, {abs_y})")
                     else:
-                        logger.info("General Merchant still not detected after swipe - tapping merchant_button again...")
+                        logger.warning("Failed to tap General Merchant after swipe - tapping merchant_button again...")
                         
                         # Tap merchant_button again using merchant_button_region
                         merchant_button_region = self.game_detector._get_region('merchant_button_region')
@@ -909,12 +1197,91 @@ class GameAutomation:
             self._close_merchant_window()
             
             # Step 7: Reset detailed_game_state
-            logger.info("Step 7: Resetting detailed_game_state...")
-            self._update_game_state({'detailed_game_state': 'unknown'})
-            logger.info("Purchasing flow completed successfully")
+            logger.info("Step 7: Setting detailed_game_state to 'purchasing'...")
+            self._update_game_state({'detailed_game_state': 'purchasing'})
+            logger.info("Go to village flow completed successfully - transitioning to purchasing state")
             
         except Exception as e:
             logger.error(f"Error in complete purchasing flow: {e}", exc_info=True)
+    
+    def _handle_go_to_village_flow(self):
+        """Execute the go-to-village flow after auto questing runs low on supplies."""
+        try:
+            map_region = self.game_detector._get_region('map_region')
+            village_list_region = self.game_detector._get_region('village_list_region')
+            first_village_region = self.game_detector._get_region('first_village_button_region')
+            village_teleport_region = self.game_detector._get_region('village_teleport_region')
+
+            if not map_region:
+                logger.warning("map_region not configured - cannot start go to village flow")
+                self._dismiss_map_if_open()
+                return
+            if not village_list_region:
+                logger.warning("village_list_region not configured - cannot scroll village list")
+                self._dismiss_map_if_open()
+                return
+            if not first_village_region:
+                logger.warning("first_village_button_region not configured - cannot select village")
+                self._dismiss_map_if_open()
+                return
+            if not village_teleport_region:
+                logger.warning("village_teleport_region not configured - cannot teleport")
+                self._dismiss_map_if_open()
+                return
+
+            logger.info("Go to village flow: tapping map_region...")
+            if not self._tap_region_center('map_region'):
+                logger.warning("Failed to tap map_region - aborting go to village flow")
+                return
+
+            screenshot = self.adb.take_screenshot()
+            if screenshot is None:
+                logger.warning("Failed to take screenshot for village list scrolling")
+                self._dismiss_map_if_open()
+                return
+
+            x1, y1, x2, y2 = village_list_region
+            screen_width = screenshot.shape[1]
+            screen_height = screenshot.shape[0]
+            x1 = max(0, min(x1, screen_width))
+            y1 = max(0, min(y1, screen_height))
+            x2 = max(0, min(x2, screen_width))
+            y2 = max(0, min(y2, screen_height))
+
+            if x2 <= x1 or y2 <= y1:
+                logger.warning(f"Invalid village_list_region coordinates: ({x1}, {y1}, {x2}, {y2})")
+                self._dismiss_map_if_open()
+                return
+
+            swipe_x = (x1 + x2) // 2
+            # For a downward swipe (finger moves top -> bottom), start higher and end lower
+            swipe_start_y = (y1 + y2) // 2 - (y2 - y1) // 4
+            swipe_end_y = (y1 + y2) // 2 + (y2 - y1) // 4
+
+            for i in range(6):
+                logger.info(f"Go to village flow: swipe {i + 1}/6 in village_list_region")
+                self._swipe(swipe_x, swipe_start_y, swipe_x, swipe_end_y, duration=500)
+                time.sleep(0.3)
+
+            logger.info("Go to village flow: tapping first_village_button_region...")
+            if not self._tap_region_center('first_village_button_region'):
+                logger.warning("Failed to tap first_village_button_region")
+                self._dismiss_map_if_open()
+                return
+
+            time.sleep(0.5)
+
+            logger.info("Go to village flow: tapping village_teleport_region...")
+            if not self._tap_region_center('village_teleport_region'):
+                logger.warning("Failed to tap village_teleport_region")
+                self._dismiss_map_if_open()
+                return
+
+            logger.info("Go to village flow: tapped teleport, setting detailed_game_state to 'purchasing'")
+            self._update_game_state({'detailed_game_state': 'purchasing'})
+            logger.info("Go to village flow completed")
+        except Exception as e:
+            logger.error(f"Error in go to village flow: {e}", exc_info=True)
     
     def _detect_and_select_health_item(self) -> bool:
         """
@@ -1167,39 +1534,23 @@ class GameAutomation:
             return True
     
     def _select_purchase_quantity(self) -> bool:
-        """
-        Select purchase quantity by tapping number 100 repeatedly.
-        Stop when estimated weight exceeds 60.
-        
-        Returns:
-            True if quantity selection completed successfully, False otherwise
-        """
+        """Tap the 100 quantity button up to five times."""
         try:
             purchase_number_100_region = self.game_detector._get_region('purchase_number_100_region')
-            estimated_weight_region = self.game_detector._get_region('estimated_weight_region')
-            
             if not purchase_number_100_region:
                 logger.warning("purchase_number_100_region not configured - cannot select quantity")
                 return False
-            
-            if not estimated_weight_region:
-                logger.warning("estimated_weight_region not configured - cannot check weight limit")
-                return False
-            
-            # Take initial screenshot and verify we're in the purchase screen
+
             screenshot = self.adb.take_screenshot()
             if screenshot is None:
                 logger.warning("Failed to take screenshot for purchase quantity selection")
                 return False
-            
-            # First, try to detect number 100 to confirm we're in the right screen
+
             logger.info("Checking if purchase quantity screen is ready...")
             number_100_pos = self._detect_number_100(screenshot, purchase_number_100_region)
             if not number_100_pos:
-                logger.warning("Number 100 not detected - purchase screen may not be ready yet")
-                # Wait a bit and try once more
                 wait_time = random.uniform(1.0, 2.0)
-                logger.info(f"Waiting {wait_time:.2f} seconds and retrying...")
+                logger.info(f"Number 100 not detected - waiting {wait_time:.2f} seconds and retrying...")
                 time.sleep(wait_time)
                 screenshot = self.adb.take_screenshot()
                 if screenshot is None:
@@ -1208,61 +1559,28 @@ class GameAutomation:
                 if not number_100_pos:
                     logger.warning("Number 100 still not detected after wait - cannot proceed with quantity selection")
                     return False
-            
-            max_taps = 20  # Maximum number of taps to prevent infinite loop
+
             tap_count = 0
-            
+            max_taps = 5
+
             while tap_count < max_taps:
-                # Check current estimated weight
-                screenshot = self.adb.take_screenshot()
-                if screenshot is None:
-                    logger.warning("Failed to take screenshot for weight check")
-                    return False
-                
-                estimated_weight = self._detect_estimated_weight(screenshot, estimated_weight_region)
-                
-                if estimated_weight is not None:
-                    logger.info(f"Current estimated weight: {estimated_weight}")
-                    
-                    if estimated_weight > 60:
-                        logger.info(f"Estimated weight ({estimated_weight}) exceeds 60 - stopping quantity selection")
-                        return True
-                
-                # Take fresh screenshot before detecting and tapping number 100
-                screenshot = self.adb.take_screenshot()
-                if screenshot is None:
-                    logger.warning("Failed to take screenshot before tapping number 100")
-                    return False
-                
-                # Detect and tap number 100
-                number_100_pos = self._detect_number_100(screenshot, purchase_number_100_region)
-                
-                if number_100_pos:
-                    abs_x, abs_y = number_100_pos
-                    logger.info(f"Number 100 detected at ({abs_x}, {abs_y}) - tapping...")
-                    
-                    if self.adb and hasattr(self.adb, 'tap'):
-                        success = self.adb.tap(abs_x, abs_y)
-                        if success:
-                            logger.info(f"Successfully tapped number 100 (tap {tap_count + 1}/{max_taps})")
-                            tap_count += 1
-                            
-                            # Wait a bit before next tap (human-like delay)
-                            wait_time = random.uniform(0.3, 0.6)
-                            time.sleep(wait_time)
-                        else:
-                            logger.warning(f"Failed to tap number 100 at ({abs_x}, {abs_y})")
-                            return False
+                abs_x, abs_y = number_100_pos
+                logger.info(f"Number 100 detected at ({abs_x}, {abs_y}) - tapping ({tap_count + 1}/{max_taps})...")
+
+                if self.adb and hasattr(self.adb, 'tap'):
+                    if self.adb.tap(abs_x, abs_y):
+                        tap_count += 1
+                        time.sleep(random.uniform(0.3, 0.6))
                     else:
-                        logger.warning("ADB manager not available or tap method not found")
+                        logger.warning(f"Failed to tap number 100 at ({abs_x}, {abs_y})")
                         return False
                 else:
-                    logger.warning("Number 100 not detected in purchase_number_100_region")
+                    logger.warning("ADB manager not available or tap method not found")
                     return False
-            
-            logger.warning(f"Reached maximum tap count ({max_taps}) - stopping quantity selection")
+
+            logger.info("Completed tapping number 100 five times")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error selecting purchase quantity: {e}", exc_info=True)
             return False
@@ -1389,82 +1707,83 @@ class GameAutomation:
     
     def _confirm_purchase(self) -> bool:
         """
-        Detect and tap confirm button
-        
-        Returns:
-            True if confirm button was successfully tapped, False otherwise
+        Detect "Confirm" text in confirm_purchase_button_region and tap it.
+        Returns True if confirm button was successfully tapped (including double confirm), False otherwise.
         """
         try:
-            # Take fresh screenshot before detecting confirm button
             screenshot = self.adb.take_screenshot()
             if screenshot is None:
                 logger.warning("Failed to take screenshot for confirm button detection")
                 return False
             
-            # Try to detect confirm button using image template
-            confirm_button_template = "confirm_button.png"
-            result = self.game_detector.template_matcher.find_template(
-                screenshot,
-                confirm_button_template,
-                multi_scale=True,
-                confidence=0.6
-            )
-            
-            if result:
-                x, y, confidence = result
-                logger.info(f"Confirm button detected at ({x}, {y}) with confidence {confidence:.3f}")
-                
-                # Take fresh screenshot before tapping confirm button
-                screenshot = self.adb.take_screenshot()
-                if screenshot is None:
-                    logger.warning("Failed to take screenshot before tapping confirm button")
-                    return False
-                
-                # Re-detect to get fresh coordinates
-                result = self.game_detector.template_matcher.find_template(
-                    screenshot,
-                    confirm_button_template,
-                    multi_scale=True,
-                    confidence=0.6
-                )
-                if not result:
-                    logger.warning("Confirm button position changed - retrying detection")
-                    return False
-                
-                x, y, confidence = result
-                
-                if self.adb and hasattr(self.adb, 'tap'):
-                    success = self.adb.tap(int(x), int(y))
-                    if success:
-                        logger.info("Successfully tapped confirm button")
+            confirm_purchase_region = self.game_detector._get_region('confirm_purchase_button_region')
+            if not confirm_purchase_region:
+                logger.warning("confirm_purchase_button_region not configured")
+                return False
+
+            x1, y1, x2, y2 = confirm_purchase_region
+            screen_width = screenshot.shape[1]
+            screen_height = screenshot.shape[0]
+
+            x1 = max(0, min(x1, screen_width))
+            y1 = max(0, min(y1, screen_height))
+            x2 = max(0, min(x2, screen_width))
+            y2 = max(0, min(y2, screen_height))
+
+            if x2 <= x1 or y2 <= y1:
+                logger.warning(f"Invalid confirm_purchase_button_region coordinates: ({x1}, {y1}, {x2}, {y2})")
+                return False
+
+            region_image = screenshot[y1:y2, x1:x2]
+            confirm_detected = self.game_detector._detect_confirm_text(region_image)
+
+            if not confirm_detected:
+                logger.warning("'Confirm' text not detected in confirm_purchase_button_region")
+                return False
+
+            logger.info("'Confirm' text detected in confirm_purchase_button_region")
+            tap_x = (x1 + x2) // 2
+            tap_y = (y1 + y2) // 2
+
+            if not (self.adb and hasattr(self.adb, 'tap')):
+                logger.warning("ADB manager not available or tap method not found")
+                return False
+
+            if not self.adb.tap(int(tap_x), int(tap_y)):
+                logger.warning(f"Failed to tap confirm purchase button at ({tap_x}, {tap_y})")
+                return False
+
+            logger.info(f"Successfully tapped confirm purchase button at ({tap_x}, {tap_y})")
+            logger.info("Double confirmation: Tapping teleport_confirm_button_region...")
+            time.sleep(0.5)
+
+            teleport_confirm_region = self.game_detector._get_region('teleport_confirm_button_region')
+            if teleport_confirm_region:
+                tc_x1, tc_y1, tc_x2, tc_y2 = teleport_confirm_region
+                tc_tap_x = (tc_x1 + tc_x2) // 2
+                tc_tap_y = (tc_y1 + tc_y2) // 2
+
+                if 0 <= tc_tap_x < screen_width and 0 <= tc_tap_y < screen_height:
+                    tc_success = self.adb.tap(int(tc_tap_x), int(tc_tap_y))
+                    if tc_success:
+                        logger.info(f"Successfully tapped teleport_confirm_button_region at ({tc_tap_x}, {tc_tap_y})")
+                        self._tap_back_button_after_purchase(screen_width, screen_height)
                         return True
                     else:
-                        logger.warning(f"Failed to tap confirm button at ({x}, {y})")
-                        return False
-            else:
-                # Try to use confirm_button_region if configured
-                confirm_button_region = self.game_detector._get_region('confirm_button_region')
-                if confirm_button_region:
-                    x1, y1, x2, y2 = confirm_button_region
-                    tap_x = (x1 + x2) // 2
-                    tap_y = (y1 + y2) // 2
-                    
-                    if self.adb and hasattr(self.adb, 'tap'):
-                        success = self.adb.tap(tap_x, tap_y)
-                        if success:
-                            logger.info("Successfully tapped confirm button using region")
-                            return True
-                        else:
-                            logger.warning(f"Failed to tap confirm button at ({tap_x}, {tap_y})")
-                            return False
+                        logger.warning(f"Failed to tap teleport_confirm_button_region at ({tc_tap_x}, {tc_tap_y})")
+                        self._tap_back_button_after_purchase(screen_width, screen_height, wait=0.0)
+                        return True
                 else:
-                    logger.warning("Confirm button not detected and confirm_button_region not configured")
-                    return False
-            
-            return False
-            
+                    logger.warning(f"Invalid teleport_confirm_button_region coordinates: ({tc_tap_x}, {tc_tap_y})")
+                    self._tap_back_button_after_purchase(screen_width, screen_height, wait=0.0)
+                    return True
+            else:
+                logger.warning("teleport_confirm_button_region not configured - skipping double confirmation")
+                self._tap_back_button_after_purchase(screen_width, screen_height, wait=0.0)
+                return True
+
         except Exception as e:
-            logger.error(f"Error confirming purchase: {e}", exc_info=True)
+            logger.error(f"Error in confirm purchase: {e}", exc_info=True)
             return False
     
     def _buy_blood_bottles(self) -> bool:
@@ -1723,3 +2042,183 @@ class GameAutomation:
                 logger.warning(f"Failed to swipe: {output}")
         except Exception as e:
             logger.error(f"Error swiping: {e}")
+    
+    def _tap_region_center(self, region_name: str, screen_width: Optional[int] = None, screen_height: Optional[int] = None, wait: float = 0.0) -> bool:
+        """Tap the center of a configured region. Returns True on success."""
+        try:
+            if wait > 0:
+                time.sleep(wait)
+
+            region = self.game_detector._get_region(region_name)
+            if not region:
+                logger.warning(f"{region_name} not configured - cannot tap region center")
+                return False
+
+            x1, y1, x2, y2 = region
+
+            # Use provided screen dimensions if available; otherwise take a quick screenshot for bounds
+            if screen_width is None or screen_height is None:
+                screenshot = self.adb.take_screenshot()
+                if screenshot is None:
+                    logger.warning(f"Failed to take screenshot while tapping {region_name}")
+                    return False
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+            else:
+                screenshot = None
+
+            x1 = max(0, min(x1, screen_width))
+            y1 = max(0, min(y1, screen_height))
+            x2 = max(0, min(x2, screen_width))
+            y2 = max(0, min(y2, screen_height))
+
+            if x2 <= x1 or y2 <= y1:
+                logger.warning(f"Invalid {region_name} coordinates: ({x1}, {y1}, {x2}, {y2})")
+                return False
+
+            tap_x = (x1 + x2) // 2
+            tap_y = (y1 + y2) // 2
+
+            if self.adb and hasattr(self.adb, 'tap'):
+                success = self.adb.tap(int(tap_x), int(tap_y))
+                if success:
+                    logger.info(f"Tapped {region_name} center at ({tap_x}, {tap_y})")
+                    return True
+                logger.warning(f"Failed to tap {region_name} center at ({tap_x}, {tap_y})")
+            else:
+                logger.warning("ADB manager not available or tap method not found")
+
+            return False
+        except Exception as e:
+            logger.error(f"Error tapping region center for {region_name}: {e}", exc_info=True)
+            return False
+
+    def _tap_back_button_after_purchase(self, screen_width: Optional[int] = None, screen_height: Optional[int] = None, wait: float = 0.5) -> None:
+        """Tap back_button_region, set detailed_game_state to 'auto_questing', and tap quest button."""
+        logger.info("After double confirmation: Tapping back_button_region...")
+        success = self._tap_region_center('back_button_region', screen_width, screen_height, wait)
+        if success:
+            logger.info("Back button tapped successfully - setting detailed_game_state to 'auto_questing'")
+            self._update_game_state({'detailed_game_state': 'auto_questing'})
+            quest_action_taken = False
+            # Check for teleporting detailed state (Rule 10 handles extraction and tapping)
+            if self.game_state['detailed_game_state'] == 'teleporting':
+                logger.info("Teleporting state detected - Rule 10 has already handled price comparison and button tapping")
+            # Check for dead state (Rule 11 handles resurrect button tapping)
+            elif self.game_state['detailed_game_state'] == 'dead':
+                logger.info("Dead state detected - Rule 11 has already handled resurrect button tapping")
+            # Rule 12: Handle purchasing state (Rule 11 sets this after tapping resurrect button)
+            elif self.game_state['detailed_game_state'] == 'purchasing':
+                last_purchasing = getattr(self, '_last_purchasing_timestamp', None)
+                now_ts = time.time()
+                purchasing_timeout_triggered = False
+
+                if last_purchasing:
+                    elapsed = now_ts - last_purchasing
+                    if elapsed > PURCHASING_TIMEOUT_THRESHOLD:
+                        logger.warning(
+                            "Purchasing state persisted for more than 5 minutes - forcing fallback to auto questing"
+                        )
+                        self._update_game_state({'detailed_game_state': 'auto_questing'})
+                        quest_tapped = self.game_detector.detect_and_tap_agent_quest_button(screenshot)
+                        if quest_tapped == 'auto_questing':
+                            logger.info("Quest button tapped from purchasing timeout fallback")
+                            self._update_game_state({'detailed_game_state': 'auto_questing'})
+                        self._last_purchasing_timestamp = None
+                        purchasing_timeout_triggered = True
+                else:
+                    self._last_purchasing_timestamp = now_ts
+
+                if not purchasing_timeout_triggered:
+                    logger.info("Rule 12: Purchasing state detected - starting purchasing flow...")
+                    self._handle_complete_purchasing_flow()
+            # Rule 13: Handle going to village state (when blood bottle is low)
+            elif self.game_state['detailed_game_state'] == 'going_to_village':
+                logger.info("Rule 13: Going to village state detected - starting go to village flow...")
+                self._handle_go_to_village_flow()
+            # Handle unknown detailed_game_state (quest detection)
+            elif self.game_state['detailed_game_state'] == 'unknown':
+                quest_action_taken = False
+                quest_matches = self.game_detector.detect_quests_in_region(screenshot)
+                if quest_matches:
+                    top_match = quest_matches[0]
+                    top_x, top_y, top_confidence, _ = top_match
+                    logger.info(f"Quest button detected in quests region at ({top_x}, {top_y}) with confidence {top_confidence:.3f} - tapping topmost entry.")
+                    if self.adb and hasattr(self.adb, 'tap'):
+                        quest_action_taken = bool(self.adb.tap(int(top_x), int(top_y)))
+                        if quest_action_taken:
+                            logger.info("Successfully tapped top quest button in quests region")
+                        else:
+                            logger.warning("Failed to tap top quest button in quests region")
+                    else:
+                        logger.warning("ADB manager not available or tap method not found for quest button tap")
+                else:
+                    logger.info("No quest buttons detected in quests region - tapping agent quest region center.")
+                    quest_action_taken = self.game_detector.tap_agent_quest_region_center(screenshot)
+
+                # Take a fresh screenshot for player parameter detection to ensure accuracy
+                param_screenshot = self.adb.take_screenshot()
+                if param_screenshot is None:
+                    logger.warning("Failed to take screenshot for player parameter detection")
+                    param_screenshot = screenshot  # Fallback to original screenshot
+                
+                # Detect player parameters (blood bottle number and bag weight)
+                player_params = self.game_detector.detect_player_parameters(param_screenshot)
+                if player_params:
+                    # Update current player parameters
+                    if 'blood_bottle' in player_params:
+                        self.player_parameters['blood_bottle'] = player_params['blood_bottle']
+                    if 'bag_weight' in player_params:
+                        self.player_parameters['bag_weight'] = player_params['bag_weight']
+                    
+                    # Update timestamp
+                    self.player_parameters['last_updated'] = time.time()
+                    
+                    # Add to history (keep last 100 entries)
+                    param_snapshot = {
+                        'blood_bottle': self.player_parameters['blood_bottle'],
+                        'bag_weight': self.player_parameters['bag_weight'],
+                        'timestamp': self.player_parameters['last_updated']
+                    }
+                    self.player_parameters_history.append(param_snapshot)
+                    if len(self.player_parameters_history) > 100:
+                        self.player_parameters_history.pop(0)  # Remove oldest entry
+                    
+                    logger.info(f"Player parameters updated: {self.player_parameters}")
+                    
+                # Rule 13: Check if blood bottle is below low limit (100) when in auto_questing state
+                blood_bottle = self.player_parameters.get('blood_bottle')
+                blood_bottle_num: Optional[int] = None
+                blood_bottle_sufficient = False
+
+                if blood_bottle is not None:
+                    try:
+                        blood_bottle_num = int(blood_bottle)
+                    except (ValueError, TypeError):
+                        blood_bottle_num = None
+
+                if blood_bottle_num is not None and blood_bottle_num > 100:
+                    blood_bottle_sufficient = True
+
+                if blood_bottle_sufficient:
+                    if self.game_state['detailed_game_state'] != 'auto_questing' and not quest_action_taken:
+                        logger.info("Playing state detected and detailed_game_state is not 'auto_questing' - checking for agent quest button...")
+                        button_result = self.game_detector.detect_and_tap_agent_quest_button(screenshot)
+                        if button_result == 'auto_questing':
+                            # Confirm button was tapped - set detailed_game_state to auto_questing
+                            logger.info("Confirm button tapped - setting detailed_game_state to 'auto_questing'")
+                            self._update_game_state({'detailed_game_state': 'auto_questing'})
+                        elif button_result:
+                            logger.info("Quest button detected and tapped successfully")
+            else:
+                logger.warning("Failed to tap back_button_region - detailed_game_state remains unchanged")
+
+    def _dismiss_map_if_open(self):
+        """Best-effort attempt to close the map overlay by tapping map_region."""
+        try:
+            map_region = self.game_detector._get_region('map_region')
+            if map_region:
+                logger.info("Attempting to dismiss map overlay by tapping map_region")
+                self._tap_region_center('map_region', wait=0.2)
+        except Exception as e:
+            logger.error(f"Error while dismissing map overlay: {e}", exc_info=True)

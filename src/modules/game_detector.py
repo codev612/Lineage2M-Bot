@@ -229,6 +229,21 @@ class GameDetector:
         self.regions = {}
         self.device_id = None  # Will be set when device is connected
         
+        # Track whether we've already detected the playing state to adjust future rules
+        self._has_entered_playing = False
+        
+        # Track detected detailed game state (e.g., 'teleporting') without changing actual_game_state
+        self._detected_detailed_state = None
+        
+        # Store tip window text positions for Rule 14
+        self._tip_window_do_not_show_pos = None
+        self._tip_window_confirm_pos = None
+        
+        # Store Accept button position detected in Rule 15
+        self._source_accept_button_pos = None
+        
+        # Store Claim button position detected in Rule 17
+        self._source_claim_button_pos = None
         
         # Game state detection patterns
         self.state_text_patterns = {
@@ -723,6 +738,570 @@ class GameDetector:
             
         except Exception as e:
             return False
+    
+    def _detect_claim_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "Claim" text in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "Claim" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "Claim" text (case-insensitive)
+                claim_keywords = ['claim']
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if "claim" is in the text
+                    for keyword in claim_keywords:
+                        if keyword in text_lower:
+                            logger.info(f"Detected 'Claim' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting Claim text: {e}")
+            return False
+    
+    def _detect_accept_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "Accept" text in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "Accept" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "Accept" text (case-insensitive)
+                accept_keywords = ['accept']
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if "accept" is in the text
+                    for keyword in accept_keywords:
+                        if keyword in text_lower:
+                            logger.info(f"Detected 'Accept' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting Accept text: {e}")
+            return False
+    
+    def _detect_do_not_show_again_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "Do not show again" text in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "Do not show again" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "Do not show again" text (case-insensitive, can be partial match)
+                keywords = ['do not show', 'do not show again', 'not show again']
+                
+                found = False
+                all_text = ""
+                for (bbox, text, confidence) in results:
+                    all_text += " " + text.lower().strip()
+                
+                all_text = all_text.lower().strip()
+                
+                # Check if any keyword is in the text
+                for keyword in keywords:
+                    if keyword in all_text:
+                        logger.info(f"Detected 'Do not show again' text: '{all_text}' (keyword: '{keyword}')")
+                        found = True
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting Do not show again text: {e}")
+            return False
+    
+    def _detect_confirm_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "confirm" text in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "confirm" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "confirm" text (case-insensitive)
+                confirm_keywords = ['confirm']
+                
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if "confirm" is in the text
+                    for keyword in confirm_keywords:
+                        if keyword in text_lower:
+                            logger.info(f"Detected 'confirm' text: '{text}' (confidence: {confidence:.3f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting confirm text: {e}")
+            return False
+    
+    def _detect_teleport_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "?" character in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "?" character is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "?" character
+                found = False
+                for (bbox, text, confidence) in results:
+                    # Check if "?" is in the text
+                    if '?' in text:
+                        logger.info(f"Detected '?' character: '{text}' (confidence: {confidence:.3f})")
+                        found = True
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting ? character: {e}")
+            return False
+    
+    def _detect_resurrect_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "Resurrect" text in a region using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            True if "Resurrect" text is detected, False otherwise
+        """
+        try:
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search for "Resurrect" text (case-insensitive)
+                found = False
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    # Check if "resurrect" is in the text
+                    if 'resurrect' in text_lower:
+                        logger.info(f"Detected 'Resurrect' text: '{text}' (confidence: {confidence:.3f})")
+                        found = True
+                        break
+                
+                return found
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.debug(f"Error detecting Resurrect text: {e}")
+            return False
+    
+    def _detect_do_not_show_again_text_position(self, region_image: np.ndarray) -> Optional[Tuple[int, int]]:
+        """
+        Detect "Do not show again" text in a region using Tesseract OCR and return its position
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            Tuple of (x, y) center coordinates of the detected text, or None if not found
+        """
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return None
+            
+            results = None
+            try:
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search variations for "Do not show again"
+                search_variations = [
+                    "do not show again",
+                    "do not show",
+                    "not show again",
+                    "donot show again",
+                ]
+                
+                for bbox, text, confidence in results:
+                    text_lower = text.lower().strip()
+                    for variation in search_variations:
+                        if variation in text_lower:
+                            # Calculate center of bounding box
+                            if len(bbox) >= 4:
+                                x_coords = [point[0] for point in bbox]
+                                y_coords = [point[1] for point in bbox]
+                                center_x = int(sum(x_coords) / len(x_coords))
+                                center_y = int(sum(y_coords) / len(y_coords))
+                                logger.debug(f"Detected 'Do not show again' text at ({center_x}, {center_y}) with confidence {confidence:.3f}")
+                                return (center_x, center_y)
+                
+                return None
+            finally:
+                if results is not None:
+                    del results
+                    
+        except Exception as e:
+            logger.error(f"Error detecting 'Do not show again' text position: {e}")
+            return None
+    
+    def _detect_confirm_text_position(self, region_image: np.ndarray) -> Optional[Tuple[int, int]]:
+        """
+        Detect "confirm" text in a region using Tesseract OCR and return its position
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            
+        Returns:
+            Tuple of (x, y) center coordinates of the detected text, or None if not found
+        """
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return None
+            
+            results = None
+            try:
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Search variations for "confirm"
+                search_variations = [
+                    "confirm",
+                    "conﬁrm",  # sometimes OCR reads i as ﬁ
+                ]
+                
+                for bbox, text, confidence in results:
+                    text_lower = text.lower().strip()
+                    for variation in search_variations:
+                        if variation in text_lower:
+                            # Calculate center of bounding box
+                            if len(bbox) >= 4:
+                                x_coords = [point[0] for point in bbox]
+                                y_coords = [point[1] for point in bbox]
+                                center_x = int(sum(x_coords) / len(x_coords))
+                                center_y = int(sum(y_coords) / len(y_coords))
+                                logger.debug(f"Detected 'confirm' text at ({center_x}, {center_y}) with confidence {confidence:.3f}")
+                                return (center_x, center_y)
+                
+                return None
+            finally:
+                if results is not None:
+                    del results
+                    
+        except Exception as e:
+            logger.error(f"Error detecting 'confirm' text position: {e}")
+            return None
+    
+    def _extract_number_from_region(self, region_image: np.ndarray, debug_name: str = None, save_debug_image: bool = False) -> Optional[float]:
+        """
+        Extract a number from a region image using Tesseract OCR
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            debug_name: Optional name for debug logging (e.g., "price", "player_total")
+            save_debug_image: If True, save the region image for debugging
+            
+        Returns:
+            Extracted number as float, or None if no number found
+        """
+        try:
+            # Save debug image if requested
+            if save_debug_image and debug_name:
+                try:
+                    import datetime
+                    from pathlib import Path
+                    import cv2
+                    debug_dir = Path('debug_screenshots')
+                    debug_dir.mkdir(exist_ok=True)
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    debug_path = debug_dir / f"{debug_name}_region_{timestamp}.png"
+                    cv2.imwrite(str(debug_path), region_image)
+                    logger.info(f"Saved {debug_name} region image to: {debug_path}")
+                except Exception as e:
+                    logger.debug(f"Failed to save debug image: {e}")
+            
+            # Use Tesseract OCR reader
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            import re
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                logger.warning(f"OCR reader not available for {debug_name or 'region'}")
+                return None
+            
+            results = None
+            try:
+                # Perform OCR on the region image
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                # Combine all text and extract numbers
+                all_text = ""
+                all_text_details = []
+                for (bbox, text, confidence) in results:
+                    all_text += " " + text.strip()
+                    all_text_details.append({
+                        'text': text.strip(),
+                        'confidence': confidence,
+                        'bbox': bbox
+                    })
+                
+                # Log raw OCR results for debugging
+                if debug_name:
+                    logger.info(f"[DEBUG {debug_name}] Raw OCR text: '{all_text}'")
+                    logger.info(f"[DEBUG {debug_name}] OCR details: {all_text_details}")
+                
+                # Extract numbers (pattern matches digits with optional commas and decimal point)
+                number_pattern = r'[\d,]+\.?\d*'
+                matches = re.findall(number_pattern, all_text)
+                
+                if matches:
+                    # Get the largest number (likely the main value)
+                    numbers = []
+                    for match in matches:
+                        try:
+                            # Remove commas and convert to float
+                            num_str = match.replace(',', '').replace(' ', '').strip()
+                            if num_str:
+                                num = float(num_str)
+                                numbers.append(num)
+                        except ValueError:
+                            continue
+                    
+                    if numbers:
+                        # Return the largest number found
+                        extracted_number = max(numbers)
+                        if debug_name:
+                            logger.info(f"[DEBUG {debug_name}] Extracted number: {extracted_number} from text: '{all_text}'")
+                            logger.info(f"[DEBUG {debug_name}] All numbers found: {numbers}, using max: {extracted_number}")
+                        else:
+                            logger.info(f"Extracted number: {extracted_number} from text: '{all_text}'")
+                        return extracted_number
+                
+                if debug_name:
+                    logger.warning(f"[DEBUG {debug_name}] No number found in text: '{all_text}'")
+                else:
+                    logger.debug(f"No number found in text: '{all_text}'")
+                return None
+            finally:
+                # Always release OCR results immediately
+                if results is not None:
+                    del results
+            
+        except Exception as e:
+            logger.error(f"Error extracting number from region ({debug_name or 'unknown'}): {e}")
+            return None
+    
+    def _extract_number_with_debug(self, region_image: np.ndarray, debug_name: str) -> dict:
+        """
+        Extract a number from a region image with detailed debug information
+        
+        Args:
+            region_image: OpenCV image array (cropped region)
+            debug_name: Name for debug logging (e.g., "price", "player_total")
+            
+        Returns:
+            Dictionary with extraction results:
+            {
+                'number': float or None,
+                'raw_text': str,
+                'all_numbers': list,
+                'ocr_details': list
+            }
+        """
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            import re
+            import datetime
+            from pathlib import Path
+            import cv2
+            
+            # Save debug image
+            try:
+                debug_dir = Path('debug_screenshots')
+                debug_dir.mkdir(exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                debug_path = debug_dir / f"{debug_name}_region_{timestamp}.png"
+                cv2.imwrite(str(debug_path), region_image)
+                logger.info(f"Saved {debug_name} region image to: {debug_path}")
+            except Exception as e:
+                logger.debug(f"Failed to save debug image: {e}")
+            
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return {
+                    'number': None,
+                    'raw_text': '',
+                    'all_numbers': [],
+                    'ocr_details': [],
+                    'error': 'OCR reader not available'
+                }
+            
+            results = None
+            try:
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+                
+                all_text = ""
+                all_text_details = []
+                for (bbox, text, confidence) in results:
+                    all_text += " " + text.strip()
+                    all_text_details.append({
+                        'text': text.strip(),
+                        'confidence': float(confidence),
+                        'bbox': [int(b) for b in bbox]
+                    })
+                
+                number_pattern = r'[\d,]+\.?\d*'
+                matches = re.findall(number_pattern, all_text)
+                
+                numbers = []
+                for match in matches:
+                    try:
+                        num_str = match.replace(',', '').replace(' ', '').strip()
+                        if num_str:
+                            num = float(num_str)
+                            numbers.append(num)
+                    except ValueError:
+                        continue
+                
+                extracted_number = max(numbers) if numbers else None
+                
+                return {
+                    'number': extracted_number,
+                    'raw_text': all_text.strip(),
+                    'all_numbers': numbers,
+                    'ocr_details': all_text_details,
+                    'error': None
+                }
+            finally:
+                if results is not None:
+                    del results
+                    
+        except Exception as e:
+            logger.error(f"Error in _extract_number_with_debug ({debug_name}): {e}")
+            return {
+                'number': None,
+                'raw_text': '',
+                'all_numbers': [],
+                'ocr_details': [],
+                'error': str(e)
+            }
     
     def _detect_accept_quest_text(self, screenshot: np.ndarray) -> Optional[Tuple[int, int]]:
         """
@@ -1472,579 +2051,9 @@ class GameDetector:
             return False
     
     def detect_and_tap_unknown_state_buttons(self, screenshot: np.ndarray) -> bool:
-        """
-        Detect and tap buttons that appear in unknown state:
-        - close_cross.png (from full screenshot)
-        - confirm_button_1.png
-        - claim_reward_button.png
-        - accept_button.png
-        - accept_quest_button.png
-        - back_button_1.png
-        - back_button_2.png
-        - resurrect_button.png
-        - check_death_penalty.png
-        
-        NOTE: Checks ALL buttons and taps ALL found buttons (no early exit)
-        
-        Args:
-            screenshot: OpenCV image array (full screenshot)
-            
-        Returns:
-            True if any button was detected and tapped, False otherwise
-        """
-        try:
-            # First, check for close_cross.png from full screenshot (with debug)
-            logger.info("[DEBUG] Checking for close_cross.png in unknown state...")
-            
-            # Check if template exists
-            close_cross_template = self.template_matcher.load_template("close_cross.png")
-            if close_cross_template is None:
-                logger.error("[ERROR] Template close_cross.png could not be loaded! Check if file exists in assets/templates/")
-            else:
-                logger.debug(f"[DEBUG] Template close_cross.png loaded successfully, size: {close_cross_template.shape}")
-            
-            # Save debug screenshot before detection
-            try:
-                debug_screenshot = screenshot.copy()
-                self._save_debug_screenshot(debug_screenshot, "close_cross_search", None)
-                logger.debug("Saved debug screenshot before close_cross detection")
-            except Exception as e:
-                logger.debug(f"Error saving debug screenshot for close_cross: {e}")
-            
-            close_cross_result = self.template_matcher.find_template(
-                screenshot,
-                "close_cross.png",
-                multi_scale=True,
-                confidence=0.7
-            )
-            if close_cross_result:
-                x, y, confidence = close_cross_result
-                logger.info(f"[OK] close_cross.png detected at ({x}, {y}) with confidence {confidence:.3f}")
-                
-                # Save debug screenshot with detection annotation
-                try:
-                    debug_screenshot = screenshot.copy()
-                    # Draw circle at detection point
-                    cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 255, 0), 3)
-                    # Draw text label
-                    cv2.putText(debug_screenshot, f"close_cross ({confidence:.2f})", 
-                              (int(x) - 50, int(y) - 10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    self._save_debug_screenshot(debug_screenshot, "close_cross_detected", {
-                        'templates': [{
-                            'name': 'close_cross',
-                            'position': [int(x), int(y)],
-                            'confidence': float(confidence),
-                            'size': [0, 0]
-                        }]
-                    })
-                    logger.debug("Saved annotated debug screenshot for close_cross detection")
-                except Exception as e:
-                    logger.debug(f"Error saving annotated debug screenshot for close_cross: {e}")
-                
-                if self.adb and hasattr(self.adb, 'tap'):
-                    success = self.adb.tap(int(x), int(y))
-                    if success:
-                        logger.info(f"[OK] Successfully tapped close_cross.png at ({x}, {y})")
-                        # Continue to check other buttons (no early exit)
-                    else:
-                        logger.warning(f"[FAIL] Failed to tap close_cross.png at ({x}, {y})")
-                else:
-                    logger.warning("ADB manager not available or tap method not found")
-            else:
-                # Not found - try to find best match for debugging
-                logger.info("[DEBUG] close_cross.png not found with confidence threshold 0.7, trying to find best match...")
-                best_match = self.template_matcher.find_template_best_match(
-                    screenshot,
-                    "close_cross.png",
-                    multi_scale=True,
-                    region=None
-                )
-                if best_match:
-                    x, y, confidence = best_match
-                    logger.warning(f"[DEBUG] Best match for close_cross.png found (below threshold 0.7): position=({x}, {y}), confidence={confidence:.3f}")
-                    
-                    # Save debug screenshot with best match annotation
-                    try:
-                        debug_screenshot = screenshot.copy()
-                        # Draw circle at best match point (in red since below threshold)
-                        cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 0, 255), 3)
-                        # Draw text label
-                        cv2.putText(debug_screenshot, f"close_cross BEST ({confidence:.2f})", 
-                                  (int(x) - 50, int(y) - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        self._save_debug_screenshot(debug_screenshot, "close_cross_best_match_below_threshold", {
-                            'templates': [{
-                                'name': 'close_cross_best_match',
-                                'position': [int(x), int(y)],
-                                'confidence': float(confidence),
-                                'size': [0, 0]
-                            }]
-                        })
-                        logger.debug("Saved debug screenshot with best match for close_cross (below threshold)")
-                    except Exception as e:
-                        logger.debug(f"Error saving debug screenshot for close_cross best match: {e}")
-                else:
-                    logger.debug("[DEBUG] No match found for close_cross.png even with best match search")
-                    # Save debug screenshot showing no match found
-                    try:
-                        debug_screenshot = screenshot.copy()
-                        self._save_debug_screenshot(debug_screenshot, "close_cross_not_found", None)
-                        logger.debug("Saved debug screenshot showing close_cross not found")
-                    except Exception as e:
-                        logger.debug(f"Error saving debug screenshot for close_cross not found: {e}")
-            
-            # List of buttons to check in order
-            buttons_to_check = [
-                "confirm_button_1.png",
-                "claim_reward_button.png",
-                "accept_button.png",
-                "accept_quest_button.png",
-                "back_button_1.png",
-                "back_button_2.png",
-                "resurrect_button.png",
-                "check_death_penalty.png"
-            ]
-            
-            logger.info("Checking for unknown state buttons (confirm_button_1, claim_reward_button, accept_button, accept_quest_button, back_button_1, back_button_2, resurrect_button, check_death_penalty)...")
-            
-            # Load regions if not loaded
-            if not self.regions and self.adb.device_id:
-                self._load_regions(self.adb.device_id)
-            
-            # Search for each button in the full screenshot (no specific region)
-            for button_template in buttons_to_check:
-                # Special handling for check_death_penalty - use OCR text detection instead of image matching
-                if button_template == "check_death_penalty.png":
-                    logger.info("Checking for check_death_penalty button using OCR text detection...")
-                    check_death_penalty_region = self._get_region('check_death_penalty')
-                    if check_death_penalty_region:
-                        x1, y1, x2, y2 = check_death_penalty_region
-                        logger.info(f"Found check_death_penalty region: ({x1}, {y1}, {x2}, {y2})")
-                        
-                        # Ensure coordinates are within screenshot bounds
-                        x1 = max(0, min(x1, screenshot.shape[1]))
-                        y1 = max(0, min(y1, screenshot.shape[0]))
-                        x2 = max(0, min(x2, screenshot.shape[1]))
-                        y2 = max(0, min(y2, screenshot.shape[0]))
-                        
-                        if x2 > x1 and y2 > y1:
-                            # Extract region from screenshot
-                            region_image = screenshot[y1:y2, x1:x2]
-                            
-                            # Save debug screenshot with region highlighted
-                            try:
-                                debug_screenshot = screenshot.copy()
-                                cv2.rectangle(debug_screenshot, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                                self._save_debug_screenshot(debug_screenshot, "check_death_penalty_region_search", {
-                                    'templates': [{
-                                        'name': 'check_death_penalty_region',
-                                        'position': [(x1 + x2) // 2, (y1 + y2) // 2],
-                                        'confidence': 1.0,
-                                        'size': [x2 - x1, y2 - y1]
-                                    }]
-                                })
-                            except Exception as e:
-                                logger.debug(f"Error saving debug screenshot for check_death_penalty region: {e}")
-                            
-                            # Use OCR to detect text in the region
-                            ocr_result = self._detect_check_death_penalty_text(region_image)
-                            if ocr_result:
-                                # All three words found - tap the center of the region
-                                tap_x = (x1 + x2) // 2
-                                tap_y = (y1 + y2) // 2
-                                logger.info(f"check_death_penalty text detected! Tapping at region center: ({tap_x}, {tap_y})")
-                                
-                                # Save debug screenshot with detection result
-                                try:
-                                    debug_screenshot = screenshot.copy()
-                                    cv2.rectangle(debug_screenshot, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                                    cv2.circle(debug_screenshot, (tap_x, tap_y), 20, (0, 255, 0), 3)
-                                    self._save_debug_screenshot(debug_screenshot, "check_death_penalty_detected", {
-                                        'templates': [{
-                                            'name': 'check_death_penalty',
-                                            'position': [tap_x, tap_y],
-                                            'confidence': 1.0,
-                                            'size': [0, 0]
-                                        }]
-                                    })
-                                except Exception as e:
-                                    logger.debug(f"Error saving debug screenshot for check_death_penalty detection: {e}")
-                                
-                                # Tap the button
-                                if self.adb and hasattr(self.adb, 'tap'):
-                                    success = self.adb.tap(int(tap_x), int(tap_y))
-                                    if success:
-                                        logger.info(f"[OK] Successfully tapped check_death_penalty at ({tap_x}, {tap_y})")
-                                        # Continue to check other buttons (no early exit)
-                                    else:
-                                        logger.warning(f"[FAIL] Failed to tap check_death_penalty at ({tap_x}, {tap_y})")
-                                else:
-                                    logger.warning("ADB manager not available or tap method not found")
-                                
-                                # Continue to next button (no early exit)
-                                continue
-                            else:
-                                logger.debug("check_death_penalty text not detected in region")
-                                # Save debug screenshot showing region was checked
-                                try:
-                                    debug_screenshot = screenshot.copy()
-                                    cv2.rectangle(debug_screenshot, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                                    self._save_debug_screenshot(debug_screenshot, "check_death_penalty_not_found", None)
-                                except Exception as e:
-                                    logger.debug(f"Error saving debug screenshot: {e}")
-                        else:
-                            logger.warning(f"Invalid check_death_penalty region bounds: ({x1}, {y1}, {x2}, {y2})")
-                    else:
-                        logger.warning("check_death_penalty region not configured - skipping OCR detection")
-                    
-                    # Skip image template matching for check_death_penalty since we use OCR
-                    continue
-                
-                # Default handling for other buttons - use image template matching
-                search_region = None
-                confidence_threshold = 0.7  # Default confidence
-                
-                # Special debug handling for accept_quest_button
-                if button_template == "accept_quest_button.png":
-                    button_name = button_template.replace(".png", "")
-                    
-                    # Use lower confidence threshold for accept_quest_button (more lenient)
-                    accept_quest_confidence = 0.5  # Lower threshold for better detection
-                    logger.info(f"[DEBUG] Searching for {button_template} with confidence threshold {accept_quest_confidence} (lowered from {confidence_threshold})")
-                    
-                    # Check if template exists and can be loaded
-                    template = self.template_matcher.load_template(button_template)
-                    if template is None:
-                        logger.error(f"[ERROR] Template {button_template} could not be loaded! Check if file exists in assets/templates/")
-                    else:
-                        logger.debug(f"[DEBUG] Template {button_template} loaded successfully, size: {template.shape}")
-                    
-                    # Check if there's a specific region configured for accept_quest_button
-                    accept_quest_region = self._get_region('accept_quest_button_region')
-                    if accept_quest_region:
-                        x1, y1, x2, y2 = accept_quest_region
-                        # Ensure coordinates are within screenshot bounds
-                        x1 = max(0, min(x1, screenshot.shape[1]))
-                        y1 = max(0, min(y1, screenshot.shape[0]))
-                        x2 = max(0, min(x2, screenshot.shape[1]))
-                        y2 = max(0, min(y2, screenshot.shape[0]))
-                        
-                        if x2 > x1 and y2 > y1:
-                            region_width = x2 - x1
-                            region_height = y2 - y1
-                            search_region = (x1, y1, region_width, region_height)
-                            logger.debug(f"Using accept_quest_button_region: ({x1}, {y1}, {x2}, {y2})")
-                        else:
-                            logger.warning(f"Invalid accept_quest_button_region bounds: ({x1}, {y1}, {x2}, {y2})")
-                            search_region = None
-                    else:
-                        search_region = None
-                        logger.debug("No accept_quest_button_region configured - searching full screenshot")
-                    
-                    # Save debug screenshot before detection
-                    try:
-                        debug_screenshot = screenshot.copy()
-                        if search_region:
-                            # Draw region rectangle
-                            x1, y1, w, h = search_region
-                            cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 3)
-                        self._save_debug_screenshot(debug_screenshot, f"{button_name}_search", None)
-                        logger.debug(f"Saved debug screenshot before {button_name} detection")
-                    except Exception as e:
-                        logger.debug(f"Error saving debug screenshot for {button_name}: {e}")
-                    
-                    # Try normal detection first with lowered threshold
-                    result = self.template_matcher.find_template(
-                        screenshot,
-                        button_template,
-                        multi_scale=True,
-                        confidence=accept_quest_confidence,
-                        region=search_region
-                    )
-                    
-                    if result:
-                        x, y, confidence = result
-                        logger.info(f"[OK] {button_name} detected at ({x}, {y}) with confidence {confidence:.3f}")
-                        
-                        # Save debug screenshot with detection annotation
-                        try:
-                            debug_screenshot = screenshot.copy()
-                            if search_region:
-                                # Draw region rectangle
-                                x1, y1, w, h = search_region
-                                cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 2)
-                            # Draw circle at detection point
-                            cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 255, 0), 3)
-                            # Draw text label
-                            cv2.putText(debug_screenshot, f"{button_name} ({confidence:.2f})", 
-                                      (int(x) - 50, int(y) - 10), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            self._save_debug_screenshot(debug_screenshot, f"{button_name}_detected", {
-                                'templates': [{
-                                    'name': button_name,
-                                    'position': [int(x), int(y)],
-                                    'confidence': float(confidence),
-                                    'size': [0, 0]
-                                }]
-                            })
-                            logger.debug(f"Saved annotated debug screenshot for {button_name} detection")
-                        except Exception as e:
-                            logger.debug(f"Error saving annotated debug screenshot for {button_name}: {e}")
-                        
-                        # Tap the button
-                        if self.adb and hasattr(self.adb, 'tap'):
-                            success = self.adb.tap(int(x), int(y))
-                            if success:
-                                logger.info(f"[OK] Successfully tapped {button_name} at ({x}, {y})")
-                                # Continue to check other buttons (no early exit)
-                            else:
-                                logger.warning(f"[FAIL] Failed to tap {button_name} at ({x}, {y})")
-                        else:
-                            logger.warning("ADB manager not available or tap method not found")
-                        
-                        # Continue to next button (no early exit)
-                        continue
-                    else:
-                        # Not found with normal threshold - try to find best match for debugging
-                        logger.info(f"[DEBUG] {button_name} not found with confidence threshold {accept_quest_confidence}, trying to find best match...")
-                        best_match = self.template_matcher.find_template_best_match(
-                            screenshot,
-                            button_template,
-                            multi_scale=True,
-                            region=search_region
-                        )
-                        
-                        if best_match:
-                            x, y, confidence = best_match
-                            logger.warning(f"[DEBUG] Best match for {button_name} found (below threshold {accept_quest_confidence}): position=({x}, {y}), confidence={confidence:.3f}")
-                            logger.warning(f"[DEBUG] Consider lowering threshold or checking if template image matches screenshot")
-                            
-                            # If best match is close to threshold, try using it anyway
-                            if confidence >= 0.4:  # Very lenient fallback
-                                logger.info(f"[DEBUG] Best match confidence {confidence:.3f} is >= 0.4, using it anyway...")
-                                # Save debug screenshot with best match annotation
-                                try:
-                                    debug_screenshot = screenshot.copy()
-                                    if search_region:
-                                        # Draw region rectangle
-                                        x1, y1, w, h = search_region
-                                        cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 2)
-                                    # Draw circle at best match point (in yellow for fallback)
-                                    cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 255, 255), 3)
-                                    # Draw text label
-                                    cv2.putText(debug_screenshot, f"{button_name} FALLBACK ({confidence:.2f})", 
-                                              (int(x) - 50, int(y) - 10), 
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                                    self._save_debug_screenshot(debug_screenshot, f"{button_name}_fallback_match", {
-                                        'templates': [{
-                                            'name': f"{button_name}_fallback",
-                                            'position': [int(x), int(y)],
-                                            'confidence': float(confidence),
-                                            'size': [0, 0]
-                                        }]
-                                    })
-                                    logger.debug(f"Saved debug screenshot with fallback match for {button_name}")
-                                except Exception as e:
-                                    logger.debug(f"Error saving debug screenshot for {button_name} fallback: {e}")
-                                
-                                # Tap the button with fallback match
-                                if self.adb and hasattr(self.adb, 'tap'):
-                                    success = self.adb.tap(int(x), int(y))
-                                    if success:
-                                        logger.info(f"[OK] Successfully tapped {button_name} using fallback match at ({x}, {y})")
-                                        # Continue to check other buttons (no early exit)
-                                    else:
-                                        logger.warning(f"[FAIL] Failed to tap {button_name} at ({x}, {y})")
-                                
-                                # Continue to next button (no early exit)
-                                continue
-                            
-                            # Save debug screenshot with best match annotation
-                            try:
-                                debug_screenshot = screenshot.copy()
-                                if search_region:
-                                    # Draw region rectangle
-                                    x1, y1, w, h = search_region
-                                    cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 2)
-                                # Draw circle at best match point (in red since below threshold)
-                                cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 0, 255), 3)
-                                # Draw text label
-                                cv2.putText(debug_screenshot, f"{button_name} BEST ({confidence:.2f})", 
-                                          (int(x) - 50, int(y) - 10), 
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                                self._save_debug_screenshot(debug_screenshot, f"{button_name}_best_match_below_threshold", {
-                                    'templates': [{
-                                        'name': f"{button_name}_best_match",
-                                        'position': [int(x), int(y)],
-                                        'confidence': float(confidence),
-                                        'size': [0, 0]
-                                    }]
-                                })
-                                logger.debug(f"Saved debug screenshot with best match for {button_name} (below threshold)")
-                            except Exception as e:
-                                logger.debug(f"Error saving debug screenshot for {button_name} best match: {e}")
-                        else:
-                            logger.debug(f"[DEBUG] No match found for {button_name} even with best match search")
-                            # Save debug screenshot showing no match found
-                            try:
-                                debug_screenshot = screenshot.copy()
-                                if search_region:
-                                    # Draw region rectangle
-                                    x1, y1, w, h = search_region
-                                    cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (0, 0, 255), 2)
-                                self._save_debug_screenshot(debug_screenshot, f"{button_name}_not_found", None)
-                                logger.debug(f"Saved debug screenshot showing {button_name} not found")
-                            except Exception as e:
-                                logger.debug(f"Error saving debug screenshot for {button_name} not found: {e}")
-                        
-                        # Continue to next button
-                        continue
-                
-                # Debug handling for all other buttons in unknown state
-                button_name = button_template.replace(".png", "")
-                logger.info(f"[DEBUG] Searching for {button_template} with confidence threshold {confidence_threshold}")
-                
-                # Check if template exists and can be loaded
-                template = self.template_matcher.load_template(button_template)
-                if template is None:
-                    logger.error(f"[ERROR] Template {button_template} could not be loaded! Check if file exists in assets/templates/")
-                    continue  # Skip this button and continue to next
-                else:
-                    logger.debug(f"[DEBUG] Template {button_template} loaded successfully, size: {template.shape}")
-                
-                # Save debug screenshot before detection
-                try:
-                    debug_screenshot = screenshot.copy()
-                    if search_region:
-                        # Draw region rectangle
-                        x1, y1, w, h = search_region
-                        cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 3)
-                    self._save_debug_screenshot(debug_screenshot, f"{button_name}_search", None)
-                    logger.debug(f"Saved debug screenshot before {button_name} detection")
-                except Exception as e:
-                    logger.debug(f"Error saving debug screenshot for {button_name}: {e}")
-                
-                # Try normal detection
-                result = self.template_matcher.find_template(
-                    screenshot,
-                    button_template,
-                    multi_scale=True,
-                    confidence=confidence_threshold,
-                    region=search_region
-                )
-                
-                if result:
-                    x, y, confidence = result
-                    logger.info(f"[OK] {button_name} detected at ({x}, {y}) with confidence {confidence:.3f}")
-                    
-                    # Save debug screenshot with detection annotation
-                    try:
-                        debug_screenshot = screenshot.copy()
-                        if search_region:
-                            # Draw region rectangle
-                            x1, y1, w, h = search_region
-                            cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 2)
-                        # Draw circle at detection point
-                        cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 255, 0), 3)
-                        # Draw text label
-                        cv2.putText(debug_screenshot, f"{button_name} ({confidence:.2f})", 
-                                  (int(x) - 50, int(y) - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        self._save_debug_screenshot(debug_screenshot, f"{button_name}_detected", {
-                            'templates': [{
-                                'name': button_name,
-                                'position': [int(x), int(y)],
-                                'confidence': float(confidence),
-                                'size': [0, 0]
-                            }]
-                        })
-                        logger.debug(f"Saved annotated debug screenshot for {button_name} detection")
-                    except Exception as e:
-                        logger.debug(f"Error saving annotated debug screenshot for {button_name}: {e}")
-                    
-                    # Tap the button
-                    if self.adb and hasattr(self.adb, 'tap'):
-                        success = self.adb.tap(int(x), int(y))
-                        if success:
-                            logger.info(f"[OK] Successfully tapped {button_name} at ({x}, {y})")
-                            # Continue to check other buttons (no early exit)
-                        else:
-                            logger.warning(f"[FAIL] Failed to tap {button_name} at ({x}, {y})")
-                    else:
-                        logger.warning("ADB manager not available or tap method not found")
-                    
-                    # Continue to next button (no early exit)
-                    continue
-                else:
-                    # Not found with normal threshold - try to find best match for debugging
-                    logger.info(f"[DEBUG] {button_name} not found with confidence threshold {confidence_threshold}, trying to find best match...")
-                    best_match = self.template_matcher.find_template_best_match(
-                        screenshot,
-                        button_template,
-                        multi_scale=True,
-                        region=search_region
-                    )
-                    
-                    if best_match:
-                        x, y, confidence = best_match
-                        logger.warning(f"[DEBUG] Best match for {button_name} found (below threshold {confidence_threshold}): position=({x}, {y}), confidence={confidence:.3f}")
-                        
-                        # Save debug screenshot with best match annotation
-                        try:
-                            debug_screenshot = screenshot.copy()
-                            if search_region:
-                                # Draw region rectangle
-                                x1, y1, w, h = search_region
-                                cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (255, 0, 0), 2)
-                            # Draw circle at best match point (in red since below threshold)
-                            cv2.circle(debug_screenshot, (int(x), int(y)), 20, (0, 0, 255), 3)
-                            # Draw text label
-                            cv2.putText(debug_screenshot, f"{button_name} BEST ({confidence:.2f})", 
-                                      (int(x) - 50, int(y) - 10), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                            self._save_debug_screenshot(debug_screenshot, f"{button_name}_best_match_below_threshold", {
-                                'templates': [{
-                                    'name': f"{button_name}_best_match",
-                                    'position': [int(x), int(y)],
-                                    'confidence': float(confidence),
-                                    'size': [0, 0]
-                                }]
-                            })
-                            logger.debug(f"Saved debug screenshot with best match for {button_name} (below threshold)")
-                        except Exception as e:
-                            logger.debug(f"Error saving debug screenshot for {button_name} best match: {e}")
-                    else:
-                        logger.debug(f"[DEBUG] No match found for {button_name} even with best match search")
-                        # Save debug screenshot showing no match found
-                        try:
-                            debug_screenshot = screenshot.copy()
-                            if search_region:
-                                # Draw region rectangle
-                                x1, y1, w, h = search_region
-                                cv2.rectangle(debug_screenshot, (x1, y1), (x1 + w, y1 + h), (0, 0, 255), 2)
-                            self._save_debug_screenshot(debug_screenshot, f"{button_name}_not_found", None)
-                            logger.debug(f"Saved debug screenshot showing {button_name} not found")
-                        except Exception as e:
-                            logger.debug(f"Error saving debug screenshot for {button_name} not found: {e}")
-                    
-                    # Continue to next button
-                    continue
-            
-            logger.info("Finished checking all unknown state buttons")
-            
-            # Check for unlock screen region and swipe if detected
-            unlock_swiped = self._detect_and_swipe_unlock_screen(screenshot)
-            if unlock_swiped:
-                logger.info("Unlock screen region detected and swiped")
-            
-            # Return True to indicate all buttons were checked (no early exit)
-            # This ensures all buttons are detected and tapped if found
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error detecting/tapping unknown state buttons: {e}")
-            return False
+        """Deprecated: unknown-state workflows have been removed."""
+        logger.debug("Unknown state handling is disabled; skipping button detection.")
+        return False
     
     def _detect_and_swipe_unlock_screen(self, screenshot: np.ndarray) -> bool:
         """
@@ -2307,7 +2316,16 @@ class GameDetector:
         """
         Detect game state from screenshot based on specific element combinations
         
-        Basic main loop rules:
+        Basic main loop rules (checked in priority order):
+        5. If screenshot includes unlock_screen_region.png → "screen_lock" (swipe screen) - checked first
+        6. If "Skip" text in skip_button_region → tap button, set detailed_game_state to "unknown" (actual_game_state remains "playing")
+        7. If "Claim" text in claim_reward_button_region → tap button and treat as playing with detailed_game_state "claim_reward"
+        8. If "Accept" text in reward_accept_button_region → tap button and treat as playing with detailed_game_state "accepting_reward"
+        9. If close_cross.png detected → "opened_dialogue" (tap button)
+        10. If "Do not show again" text in do_not_show_again_region AND "confirm" text in tip_joining_confirm_region → "confirming_tips" (tap both)
+        11. If do_not_show.png AND confirm_button_2.png detected in tip_window_region → store tap positions, return "confirming_tips_window"/"confirming_tips_window_partial"
+        12. If short_button.png AND "?" text in confirm_description_region → tap confirm button, set detailed_game_state to "auto_questing" if tap succeeds (actual_game_state remains "playing")
+        13. If game is in "playing" state AND "Resurrect" text in resurrect_button_region → tap resurrect_button_region, set detailed_game_state to "purchasing" if tap succeeds (actual_game_state remains "playing")
         1. If screenshot includes "tap" text AND select_server_button.png → "select_server"
         2. If screenshot includes "Character" text AND enter_button.png → "select_character"
         3. If screenshot includes short_button.png → "playing"
@@ -2319,11 +2337,18 @@ class GameDetector:
             
         Returns:
             Game state string: 
-            - 'select_server', 'select_character', 'unknown'
+            - 'select_server', 'select_character', 'screen_lock', 'claim_reward', 'accepting_reward', 'opened_dialogue', 'confirming_tips', 'unknown'
             - 'playing' (in-game state)
+            
+        Note:
+            Rule 10 sets detailed_game_state to 'teleporting' but returns 'playing' for actual_game_state.
+            Use get_detected_detailed_state() to retrieve the detected detailed state.
         """
         try:
             logger.info("Starting game state detection from screenshot...")
+            
+            # Clear detected detailed state from previous detection
+            self._detected_detailed_state = None
             
             # Collect annotation data for debug images
             annotations = {'templates': [], 'text': []}
@@ -2332,40 +2357,794 @@ class GameDetector:
             if debug:
                 self._save_debug_screenshot(screenshot, "detection_start")
             
-            # Rule 1: Check for "tap" text AND select_server_button.png
-            logger.info("Rule 1: Checking for 'tap' text and select_server_button.png...")
-            tap_result = self._detect_tap_screen_text_debug(screenshot) if debug else self._detect_tap_screen_text(screenshot)
-            if debug and isinstance(tap_result, dict):
-                tap_detected = tap_result.get('detected', False)
-                if tap_result.get('detections'):
-                    annotations['text'].extend(tap_result['detections'])
-            else:
-                tap_detected = tap_result if isinstance(tap_result, bool) else False
-            logger.info(f"  - 'tap' text detected: {tap_detected}")
+            tap_detected = False
+            select_server_button_detected = False
+            character_text_detected = False
+            enter_button_detected = False
+            unlock_screen_detected = False
+            claim_reward_detected = False
+            accepting_reward_detected = False
+            close_cross_detected = False
+            do_not_show_detected = False
+            confirm_tip_detected = False
+            teleport_short_button_detected = False
+            teleport_text_detected = False
+            resurrect_text_detected = False
             
-            select_server_result = self._detect_select_server_button_debug(screenshot) if debug else self._detect_select_server_button(screenshot)
-            if debug and isinstance(select_server_result, dict):
-                select_server_button_detected = select_server_result.get('detected', False)
-                if select_server_result.get('position'):
+            # Template matching confidences
+            do_not_show_template_confidence = 0.7
+            confirm_button_template_confidence = 0.7
+            accept_confidence = 0.7
+            claim_confidence = 0.7
+
+            # Always check for screen lock first (even if already in playing state)
+            logger.info("Rule 5: Checking for unlock_screen_region.png...")
+            unlock_result = self.template_matcher.find_template(
+                screenshot,
+                "unlock_screen_region.png",
+                multi_scale=True,
+                confidence=0.7
+            )
+            unlock_screen_detected = unlock_result is not None
+            if unlock_screen_detected and unlock_result:
+                x, y, confidence = unlock_result
+                logger.info(f"  - unlock_screen_region.png detected at ({x}, {y}) with confidence {confidence:.3f}")
+                if debug:
                     annotations['templates'].append({
-                        'name': 'select_server_button',
-                        'position': select_server_result['position'],
-                        'confidence': select_server_result.get('confidence', 0),
-                        'size': select_server_result.get('size', (100, 100)),
-                        'below_threshold': select_server_result.get('below_threshold', False)
+                        'name': 'unlock_screen_region',
+                        'position': [int(x), int(y)],
+                        'confidence': float(confidence),
+                        'size': [0, 0]
                     })
-            else:
-                select_server_button_detected = select_server_result if isinstance(select_server_result, bool) else False
-            logger.info(f"  - select_server_button.png detected: {select_server_button_detected}")
-            
-            if tap_detected and select_server_button_detected:
-                detected_state = 'select_server'
-                logger.info(f"Game state detected: {detected_state} (tap text + select_server_button.png)")
+                detected_state = 'screen_lock'
+                logger.info(f"Game state detected: {detected_state} (unlock_screen_region.png found)")
                 if debug:
                     self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
-                    self._save_template_images(['select_server_button.png'])
+                    self._save_template_images(['unlock_screen_region.png'])
+                return detected_state
+            else:
+                logger.info(f"  - unlock_screen_region.png detected: {unlock_screen_detected}")
+            
+            # Rule 6: Check for "Skip" text in skip_button_region
+            logger.info("Rule 6: Checking for 'Skip' text in skip_button_region...")
+            skip_button_region = self._get_region('skip_button_region')
+            if skip_button_region:
+                x1, y1, x2, y2 = skip_button_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    skip_button_detected = self._detect_skip_text(region_image)
+                    if skip_button_detected:
+                        logger.info("  - 'Skip' text detected in skip_button_region")
+                        if debug:
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': 'Skip',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info("  - 'Skip' text not detected in skip_button_region")
+                else:
+                    logger.debug("Invalid skip_button_region coordinates")
+            else:
+                logger.debug("skip_button_region not configured")
+
+            if skip_button_detected:
+                logger.info("Rule 6: 'Skip' text found - attempting to tap skip button and reset detailed state")
+                tap_success = False
+                if skip_button_region and self.adb and hasattr(self.adb, 'tap'):
+                    x1, y1, x2, y2 = skip_button_region
+                    tap_x = (x1 + x2) // 2
+                    tap_y = (y1 + y2) // 2
+                    screen_width = screenshot.shape[1]
+                    screen_height = screenshot.shape[0]
+                    if 0 <= tap_x < screen_width and 0 <= tap_y < screen_height:
+                        logger.info(f"[RULE 6] Tapping skip button at ({tap_x}, {tap_y})")
+                        tap_success = self.adb.tap(int(tap_x), int(tap_y))
+                        if tap_success:
+                            logger.info("[RULE 6] Successfully tapped skip button")
+                        else:
+                            logger.warning("[RULE 6] Failed to tap skip button")
+                    else:
+                        logger.warning(f"[RULE 6] Invalid skip_button_region coordinates: ({tap_x}, {tap_y})")
+                else:
+                    if not skip_button_region:
+                        logger.warning("[RULE 6] skip_button_region not configured")
+                    if not (self.adb and hasattr(self.adb, 'tap')):
+                        logger.warning("[RULE 6] ADB manager not available or tap method not found")
+
+                self._detected_detailed_state = 'unknown'
+                logger.info("Rule 6: Setting detailed_game_state to 'unknown'")
+
+                if not self._has_entered_playing:
+                    logger.debug("Marking playing state as reached via Rule 6")
+                    self._has_entered_playing = True
+
+                if debug:
+                    self._save_debug_screenshot(screenshot, "detected_skip_button", annotations)
+
+                return 'playing'
+
+            # Rule 7: Check for "Claim" text in claim_reward_button_region
+            logger.info("Rule 7: Checking for 'Claim' text in claim_reward_button_region...")
+            
+            # Check for "Claim" text in claim_reward_button_region using OCR
+            claim_reward_region = self._get_region('claim_reward_button_region')
+            if claim_reward_region:
+                x1, y1, x2, y2 = claim_reward_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    # Extract region from screenshot
+                    region_image = screenshot[y1:y2, x1:x2]
+                    
+                    # Use OCR to detect "Claim" text in the region
+                    claim_reward_detected = self._detect_claim_text(region_image)
+                    if claim_reward_detected:
+                        logger.info(f"  - 'Claim' text detected in claim_reward_button_region")
+                        if debug:
+                            # Calculate center position for annotation
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': 'Claim',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info(f"  - 'Claim' text not detected in claim_reward_button_region")
+                else:
+                    logger.debug("Invalid claim_reward_button_region coordinates")
+            else:
+                logger.debug("claim_reward_button_region not configured")
+            
+            if claim_reward_detected:
+                logger.info("Rule 7: 'Claim' text found - treating as playing with detailed state 'claim_reward'")
+                self._detected_detailed_state = 'claim_reward'
+                if not self._has_entered_playing:
+                    logger.debug("Marking playing state as reached via Rule 7")
+                    self._has_entered_playing = True
+                if debug:
+                    self._save_debug_screenshot(screenshot, "detected_claim_reward", annotations)
+                return 'playing'
+            
+            # Rule 8: Check for "Accept" text in reward_accept_button_region
+            logger.info("Rule 8: Checking for 'Accept' text in reward_accept_button_region...")
+            accepting_reward_detected = False
+            
+            # Check for "Accept" text in reward_accept_button_region using OCR
+            reward_accept_region = self._get_region('reward_accept_button_region')
+            if reward_accept_region:
+                x1, y1, x2, y2 = reward_accept_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    # Extract region from screenshot
+                    region_image = screenshot[y1:y2, x1:x2]
+                    
+                    # Use OCR to detect "Accept" text in the region
+                    accepting_reward_detected = self._detect_accept_text(region_image)
+                    if accepting_reward_detected:
+                        logger.info(f"  - 'Accept' text detected in reward_accept_button_region")
+                        if debug:
+                            # Calculate center position for annotation
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': 'Accept',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info(f"  - 'Accept' text not detected in reward_accept_button_region")
+                else:
+                    logger.debug("Invalid reward_accept_button_region coordinates")
+            else:
+                logger.debug("reward_accept_button_region not configured")
+            
+            if accepting_reward_detected:
+                logger.info("Rule 8: 'Accept' text found - treating as playing with detailed state 'accepting_reward'")
+                self._detected_detailed_state = 'accepting_reward'
+                if not self._has_entered_playing:
+                    logger.debug("Marking playing state as reached via Rule 8")
+                    self._has_entered_playing = True
+                if debug:
+                    self._save_debug_screenshot(screenshot, "detected_accepting_reward", annotations)
+                return 'playing'
+            
+            # Rule 9: Check for close_cross.png
+            logger.info("Rule 9: Checking for close_cross.png...")
+            close_cross_detected = False
+            close_cross_position = None
+            close_cross_confidence = 0.0
+            
+            close_cross_result = self.template_matcher.find_template(
+                screenshot,
+                "close_cross.png",
+                multi_scale=True,
+                confidence=0.9
+            )
+            
+            if close_cross_result:
+                close_cross_detected = True
+                close_cross_position = (int(close_cross_result[0]), int(close_cross_result[1]))
+                close_cross_confidence = float(close_cross_result[2])
+                logger.info(f"  - close_cross.png detected at {close_cross_position} with confidence {close_cross_confidence:.3f}")
+                if debug:
+                    annotations['templates'].append({
+                        'name': 'close_cross',
+                        'position': list(close_cross_position),
+                        'confidence': close_cross_confidence,
+                        'size': [0, 0]
+                    })
+            else:
+                logger.info(f"  - close_cross.png not detected")
+            
+            if close_cross_detected:
+                detected_state = 'opened_dialogue'
+                logger.info(f"Game state detected: {detected_state} (close_cross.png found)")
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                    self._save_template_images(['close_cross.png'])
                 return detected_state
             
+            # Rule 10: Check for "Do not show again" text in do_not_show_again_region AND "confirm" text in tip_joining_confirm_region
+            logger.info("Rule 10: Checking for 'Do not show again' text in do_not_show_again_region AND 'confirm' text in tip_joining_confirm_region...")
+            
+            # Check for "Do not show again" text in do_not_show_again_region
+            do_not_show_region = self._get_region('do_not_show_again_region')
+            if do_not_show_region:
+                x1, y1, x2, y2 = do_not_show_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    do_not_show_detected = self._detect_do_not_show_again_text(region_image)
+                    if do_not_show_detected:
+                        logger.info(f"  - 'Do not show again' text detected in do_not_show_again_region")
+                        if debug:
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': 'Do not show again',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info(f"  - 'Do not show again' text not detected in do_not_show_again_region")
+                else:
+                    logger.debug("Invalid do_not_show_again_region coordinates")
+            else:
+                logger.debug("do_not_show_again_region not configured")
+            
+            # Check for "confirm" text in tip_joining_confirm_region
+            tip_confirm_region = self._get_region('tip_joining_confirm_region')
+            if tip_confirm_region:
+                x1, y1, x2, y2 = tip_confirm_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    confirm_tip_detected = self._detect_confirm_text(region_image)
+                    if confirm_tip_detected:
+                        logger.info(f"  - 'confirm' text detected in tip_joining_confirm_region")
+                        if debug:
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': 'confirm',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info(f"  - 'confirm' text not detected in tip_joining_confirm_region")
+                else:
+                    logger.debug("Invalid tip_joining_confirm_region coordinates")
+            else:
+                logger.debug("tip_joining_confirm_region not configured")
+            
+            if do_not_show_detected and confirm_tip_detected:
+                detected_state = 'confirming_tips'
+                logger.info(f"Game state detected: {detected_state} ('Do not show again' text AND 'confirm' text found)")
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                return detected_state
+
+            # Rule 16: Check for "Do not show again" or "confirm" text in tip_window_region (high priority)
+            logger.info("Rule 16: Checking for do_not_show.png or confirm_button_2.png in tip_window_region (high priority)...")
+            self._tip_window_do_not_show_pos = None
+            self._tip_window_confirm_pos = None
+            tip_window_bounds: Optional[Tuple[int, int, int, int]] = None
+
+            tip_window_region = self._get_region('tip_window_region')
+            if tip_window_region:
+                x1, y1, x2, y2 = tip_window_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+
+                if x2 > x1 and y2 > y1:
+                    tip_window_bounds = (x1, y1, x2, y2)
+                    region_image = screenshot[y1:y2, x1:x2]
+
+                    do_not_show_result = self.template_matcher.find_template(
+                        region_image,
+                        "do_not_show.png",
+                        multi_scale=True,
+                        confidence=do_not_show_template_confidence
+                    )
+                    if do_not_show_result:
+                        rel_x, rel_y, rel_conf = do_not_show_result
+                        abs_pos = (x1 + int(rel_x), y1 + int(rel_y))
+                        self._tip_window_do_not_show_pos = abs_pos
+                        logger.info(
+                            f"  - do_not_show.png detected in tip_window_region at ({abs_pos[0]}, {abs_pos[1]}) with confidence {rel_conf:.3f}"
+                        )
+                        if debug:
+                            annotations['templates'].append({
+                                'name': 'do_not_show.png',
+                                'position': [abs_pos[0], abs_pos[1]],
+                                'confidence': float(rel_conf),
+                                'size': [0, 0]
+                            })
+                    else:
+                        logger.info("  - do_not_show.png not detected in tip_window_region")
+
+                    confirm_button_result = self.template_matcher.find_template(
+                        region_image,
+                        "confirm_button_2.png",
+                        multi_scale=True,
+                        confidence=confirm_button_template_confidence
+                    )
+                    if confirm_button_result:
+                        rel_x, rel_y, rel_conf = confirm_button_result
+                        abs_pos = (x1 + int(rel_x), y1 + int(rel_y))
+                        self._tip_window_confirm_pos = abs_pos
+                        logger.info(
+                            f"  - confirm_button_2.png detected in tip_window_region at ({abs_pos[0]}, {abs_pos[1]}) with confidence {rel_conf:.3f}"
+                        )
+                        if debug:
+                            annotations['templates'].append({
+                                'name': 'confirm_button_2.png',
+                                'position': [abs_pos[0], abs_pos[1]],
+                                'confidence': float(rel_conf),
+                                'size': [0, 0]
+                            })
+                    else:
+                        logger.info("  - confirm_button_2.png not detected in tip_window_region")
+                else:
+                    logger.debug("Invalid tip_window_region coordinates")
+            else:
+                logger.debug("tip_window_region not configured")
+
+            if self._tip_window_do_not_show_pos and self._tip_window_confirm_pos:
+                detected_state = 'confirming_tips_window'
+                logger.info("Game state detected: confirming_tips_window (Rule 16)")
+                if debug and tip_window_bounds:
+                    self._save_debug_screenshot(screenshot, "detected_confirming_tips_window", annotations)
+                return detected_state
+
+            if self._tip_window_do_not_show_pos or self._tip_window_confirm_pos:
+                if not self._tip_window_do_not_show_pos and tip_window_bounds:
+                    center_x = (tip_window_bounds[0] + tip_window_bounds[2]) // 2
+                    center_y = (tip_window_bounds[1] + tip_window_bounds[3]) // 2
+                    self._tip_window_do_not_show_pos = (center_x, center_y)
+                if not self._tip_window_confirm_pos and tip_window_bounds:
+                    center_x = (tip_window_bounds[0] + tip_window_bounds[2]) // 2
+                    center_y = (tip_window_bounds[1] + tip_window_bounds[3]) // 2
+                    self._tip_window_confirm_pos = (center_x, center_y)
+
+                detected_state = 'confirming_tips_window_partial'
+                logger.info("Game state detected: confirming_tips_window_partial (Rule 16 partial)")
+                if debug and tip_window_bounds:
+                    self._save_debug_screenshot(screenshot, "detected_confirming_tips_window_partial", annotations)
+                return detected_state
+
+            # Rule 14: Check for "Do not show again" text AND "confirm" text in tip_window_region
+            logger.info("Rule 14: Checking for 'Do not show again' text AND 'confirm' text in tip_window_region...")
+
+            # Reset stored positions before detection
+            self._tip_window_do_not_show_pos = None
+            self._tip_window_confirm_pos = None
+
+            do_not_show_pos = None
+            confirm_pos = None
+
+            tip_window_region = self._get_region('tip_window_region')
+            if tip_window_region:
+                x1, y1, x2, y2 = tip_window_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+
+                    # Detect "Do not show again" text position
+                    do_not_show_pos = self._detect_do_not_show_again_text_position(region_image)
+                    if do_not_show_pos:
+                        # Convert relative position to absolute position
+                        do_not_show_pos = (x1 + do_not_show_pos[0], y1 + do_not_show_pos[1])
+                        logger.info(f"  - 'Do not show again' text detected in tip_window_region at ({do_not_show_pos[0]}, {do_not_show_pos[1]})")
+                        if debug:
+                            annotations['text'].append({
+                                'text': 'Do not show again',
+                                'position': [do_not_show_pos[0], do_not_show_pos[1]],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info("  - 'Do not show again' text not detected in tip_window_region")
+
+                    # Detect "confirm" text position
+                    confirm_pos = self._detect_confirm_text_position(region_image)
+                    if confirm_pos:
+                        # Convert relative position to absolute position
+                        confirm_pos = (x1 + confirm_pos[0], y1 + confirm_pos[1])
+                        logger.info(f"  - 'confirm' text detected in tip_window_region at ({confirm_pos[0]}, {confirm_pos[1]})")
+                        if debug:
+                            annotations['text'].append({
+                                'text': 'confirm',
+                                'position': [confirm_pos[0], confirm_pos[1]],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info("  - 'confirm' text not detected in tip_window_region")
+                else:
+                    logger.debug("Invalid tip_window_region coordinates")
+            else:
+                logger.debug("tip_window_region not configured")
+
+            if do_not_show_pos and confirm_pos:
+                detected_state = 'confirming_tips_window'
+                logger.info(f"Game state detected: {detected_state} ('Do not show again' text AND 'confirm' text found in tip_window_region)")
+                # Store positions for later use in automation
+                self._tip_window_do_not_show_pos = do_not_show_pos
+                self._tip_window_confirm_pos = confirm_pos
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                return detected_state
+            
+            # Rule 15: Check for "Accept" text in source_accept_button_region
+            logger.info("Rule 15: Checking for 'Accept' text in source_accept_button_region...")
+            self._source_accept_button_pos = None
+
+            source_accept_region = self._get_region('source_accept_button_region')
+            if source_accept_region:
+                x1, y1, x2, y2 = source_accept_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    accept_text_detected = self._detect_accept_text(region_image)
+
+                    if accept_text_detected:
+                        tap_x = (x1 + x2) // 2
+                        tap_y = (y1 + y2) // 2
+                        self._source_accept_button_pos = (tap_x, tap_y)
+                        logger.info(f"  - 'Accept' text detected in source_accept_button_region at ({tap_x}, {tap_y})")
+                        if debug:
+                            annotations['text'].append({
+                                'text': 'Accept',
+                                'position': [tap_x, tap_y],
+                                'confidence': 1.0
+                            })
+
+                        detected_state = 'accept_button'
+                        logger.info("Game state detected: accept_button ('Accept' text found in source_accept_button_region)")
+                        if debug:
+                            self._save_debug_screenshot(screenshot, "detected_accept_button", annotations)
+                        return detected_state
+                    else:
+                        logger.info("  - 'Accept' text not detected in source_accept_button_region")
+                else:
+                    logger.debug("Invalid source_accept_button_region coordinates")
+            else:
+                logger.debug("source_accept_button_region not configured")
+            
+            # Rule 17: Check for "Claim" text in source_claim_button_region
+            logger.info("Rule 17: Checking for 'Claim' text in source_claim_button_region...")
+            self._source_claim_button_pos = None
+
+            source_claim_region = self._get_region('source_claim_button_region')
+            if source_claim_region:
+                x1, y1, x2, y2 = source_claim_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    claim_text_detected = self._detect_claim_text(region_image)
+
+                    if claim_text_detected:
+                        tap_x = (x1 + x2) // 2
+                        tap_y = (y1 + y2) // 2
+                        self._source_claim_button_pos = (tap_x, tap_y)
+                        logger.info(f"  - 'Claim' text detected in source_claim_button_region at ({tap_x}, {tap_y})")
+                        if debug:
+                            annotations['text'].append({
+                                'text': 'Claim',
+                                'position': [tap_x, tap_y],
+                                'confidence': 1.0
+                            })
+
+                        if self.adb and hasattr(self.adb, 'tap'):
+                            if self.adb.tap(int(tap_x), int(tap_y)):
+                                logger.info("Rule 17: Successfully tapped 'Claim' button in source_claim_button_region")
+                            else:
+                                logger.warning("Rule 17: Failed to tap 'Claim' button in source_claim_button_region")
+                        else:
+                            logger.warning("Rule 17: ADB tap not available - cannot tap 'Claim' button")
+
+                        self._source_claim_button_pos = None
+
+                        detected_state = 'claim_button'
+                        logger.info("Game state detected: claim_button ('Claim' text found and tapped in source_claim_button_region)")
+                        if debug:
+                            self._save_debug_screenshot(screenshot, "detected_claim_button", annotations)
+                        return detected_state
+                    else:
+                        logger.info("  - 'Claim' text not detected in source_claim_button_region")
+                else:
+                    logger.debug("Invalid source_claim_button_region coordinates")
+            else:
+                logger.debug("source_claim_button_region not configured")
+            
+            # Rule 10: Check for short_button.png AND "?" text in confirm_description_region
+            logger.info("Rule 10: Checking for short_button.png AND '?' text in confirm_description_region...")
+            
+            # Check for short_button.png
+            short_button_result = self.template_matcher.find_template(
+                screenshot,
+                "short_button.png",
+                multi_scale=True,
+                confidence=0.7
+            )
+            if short_button_result:
+                teleport_short_button_detected = True
+                x, y, confidence = short_button_result
+                logger.info(f"  - short_button.png detected at ({x}, {y}) with confidence {confidence:.3f}")
+                if debug:
+                    annotations['templates'].append({
+                        'name': 'short_button',
+                        'position': [int(x), int(y)],
+                        'confidence': confidence,
+                        'size': [0, 0]
+                    })
+            else:
+                logger.info(f"  - short_button.png not detected")
+            
+            # Check for "?" text in confirm_description_region
+            confirm_desc_region = self._get_region('confirm_description_region')
+            if confirm_desc_region:
+                x1, y1, x2, y2 = confirm_desc_region
+                screen_width = screenshot.shape[1]
+                screen_height = screenshot.shape[0]
+                x1 = max(0, min(x1, screen_width))
+                y1 = max(0, min(y1, screen_height))
+                x2 = max(0, min(x2, screen_width))
+                y2 = max(0, min(y2, screen_height))
+                
+                if x2 > x1 and y2 > y1:
+                    region_image = screenshot[y1:y2, x1:x2]
+                    teleport_text_detected = self._detect_teleport_text(region_image)
+                    if teleport_text_detected:
+                        logger.info(f"  - '?' character detected in confirm_description_region")
+                        if debug:
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            annotations['text'].append({
+                                'text': '?',
+                                'position': [center_x, center_y],
+                                'confidence': 1.0
+                            })
+                    else:
+                        logger.info(f"  - '?' character not detected in confirm_description_region")
+                else:
+                    logger.debug("Invalid confirm_description_region coordinates")
+            else:
+                logger.debug("confirm_description_region not configured")
+            
+            if teleport_short_button_detected and teleport_text_detected:
+                # Teleporting detected - tap confirm button
+                logger.info(f"Rule 10: Teleporting detected (short_button.png AND '?' character found) - tapping confirm button...")
+                
+                # Get teleport confirm button region from config
+                teleport_confirm_region = self._get_region('teleport_confirm_button_region')
+                
+                tap_success = False
+                if teleport_confirm_region and self.adb and hasattr(self.adb, 'tap'):
+                    x1, y1, x2, y2 = teleport_confirm_region
+                    tap_x = (x1 + x2) // 2
+                    tap_y = (y1 + y2) // 2
+                    
+                    screen_width = screenshot.shape[1]
+                    screen_height = screenshot.shape[0]
+                    if 0 <= tap_x < screen_width and 0 <= tap_y < screen_height:
+                        logger.info(f"[RULE 10] Tapping teleport confirm button at ({tap_x}, {tap_y})")
+                        tap_success = self.adb.tap(int(tap_x), int(tap_y))
+                        if tap_success:
+                            logger.info(f"[RULE 10] Successfully tapped teleport confirm button")
+                        else:
+                            logger.warning(f"[RULE 10] Failed to tap teleport confirm button")
+                    else:
+                        logger.warning(f"[RULE 10] Invalid teleport_confirm_button_region coordinates: ({tap_x}, {tap_y})")
+                else:
+                    if not teleport_confirm_region:
+                        logger.warning("[RULE 10] teleport_confirm_button_region not configured")
+                    if not (self.adb and hasattr(self.adb, 'tap')):
+                        logger.warning("[RULE 10] ADB manager not available or tap method not found")
+                
+                # Set detailed_game_state to 'auto_questing' after successfully tapping confirm button
+                if tap_success:
+                    self._detected_detailed_state = 'auto_questing'
+                    logger.info(f"Rule 10: Successfully tapped confirm button - setting detailed_game_state to 'auto_questing'")
+                else:
+                    # If tap failed, set to 'teleporting' to indicate teleporting was detected but action not completed
+                    self._detected_detailed_state = 'teleporting'
+                    logger.info(f"Rule 10: Failed to tap confirm button - setting detailed_game_state to 'teleporting'")
+                if debug:
+                    self._save_debug_screenshot(screenshot, f"detected_teleporting", annotations)
+                    self._save_template_images(['short_button.png'])
+                # Don't return here - continue with normal detection to return 'playing' state
+            
+            # Rule 11: Check for "Resurrect" text in resurrect_button_region (only if in playing state)
+            if self._has_entered_playing:
+                logger.info("Rule 11: Checking for 'Resurrect' text in resurrect_button_region...")
+                
+                resurrect_button_region = self._get_region('resurrect_button_region')
+                if resurrect_button_region:
+                    x1, y1, x2, y2 = resurrect_button_region
+                    screen_width = screenshot.shape[1]
+                    screen_height = screenshot.shape[0]
+                    x1 = max(0, min(x1, screen_width))
+                    y1 = max(0, min(y1, screen_height))
+                    x2 = max(0, min(x2, screen_width))
+                    y2 = max(0, min(y2, screen_height))
+                    
+                    if x2 > x1 and y2 > y1:
+                        region_image = screenshot[y1:y2, x1:x2]
+                        resurrect_text_detected = self._detect_resurrect_text(region_image)
+                        if resurrect_text_detected:
+                            logger.info(f"  - 'Resurrect' text detected in resurrect_button_region")
+                            if debug:
+                                center_x = (x1 + x2) // 2
+                                center_y = (y1 + y2) // 2
+                                annotations['text'].append({
+                                    'text': 'Resurrect',
+                                    'position': [center_x, center_y],
+                                    'confidence': 1.0
+                                })
+                        else:
+                            logger.info(f"  - 'Resurrect' text not detected in resurrect_button_region")
+                    else:
+                        logger.debug("Invalid resurrect_button_region coordinates")
+                else:
+                    logger.debug("resurrect_button_region not configured")
+                
+                if resurrect_text_detected:
+                    # Resurrect text detected - tap resurrect button and set detailed_game_state accordingly
+                    logger.info(f"Rule 11: Resurrect text detected - tapping resurrect button...")
+                    
+                    tap_success = False
+                    # Tap resurrect_button_region
+                    if resurrect_button_region and self.adb and hasattr(self.adb, 'tap'):
+                        x1, y1, x2, y2 = resurrect_button_region
+                        tap_x = (x1 + x2) // 2
+                        tap_y = (y1 + y2) // 2
+                        
+                        screen_width = screenshot.shape[1]
+                        screen_height = screenshot.shape[0]
+                        if 0 <= tap_x < screen_width and 0 <= tap_y < screen_height:
+                            logger.info(f"[RULE 11] Tapping resurrect button at ({tap_x}, {tap_y})")
+                            tap_success = self.adb.tap(int(tap_x), int(tap_y))
+                            if tap_success:
+                                logger.info(f"[RULE 11] Successfully tapped resurrect button")
+                            else:
+                                logger.warning(f"[RULE 11] Failed to tap resurrect button")
+                        else:
+                            logger.warning(f"[RULE 11] Invalid resurrect_button_region coordinates: ({tap_x}, {tap_y})")
+                    else:
+                        if not resurrect_button_region:
+                            logger.warning("[RULE 11] resurrect_button_region not configured")
+                        if not (self.adb and hasattr(self.adb, 'tap')):
+                            logger.warning("[RULE 11] ADB manager not available or tap method not found")
+                    
+                    # Set detailed_game_state based on tap success
+                    if tap_success:
+                        # After successfully tapping resurrect button, set to 'purchasing'
+                        self._detected_detailed_state = 'purchasing'
+                        logger.info(f"Rule 11: Successfully tapped resurrect button - setting detailed_game_state to 'purchasing'")
+                        if debug:
+                            self._save_debug_screenshot(screenshot, f"detected_purchasing", annotations)
+                    else:
+                        # If tap failed, set to 'dead' to indicate dead state detected but action not completed
+                        self._detected_detailed_state = 'dead'
+                        logger.info(f"Rule 11: Failed to tap resurrect button - setting detailed_game_state to 'dead'")
+                        if debug:
+                            self._save_debug_screenshot(screenshot, f"detected_dead", annotations)
+            
+            if self._has_entered_playing:
+                logger.info("Playing state already confirmed; skipping further detection checks.")
+                return 'playing'
+
+            if not self._has_entered_playing:
+                # Rule 1: Check for "tap" text AND select_server_button.png
+                logger.info("Rule 1: Checking for 'tap' text and select_server_button.png...")
+                tap_result = self._detect_tap_screen_text_debug(screenshot) if debug else self._detect_tap_screen_text(screenshot)
+                if debug and isinstance(tap_result, dict):
+                    tap_detected = tap_result.get('detected', False)
+                    if tap_result.get('detections'):
+                        annotations['text'].extend(tap_result['detections'])
+                else:
+                    tap_detected = tap_result if isinstance(tap_result, bool) else False
+                logger.info(f"  - 'tap' text detected: {tap_detected}")
+
+                select_server_result = self._detect_select_server_button_debug(screenshot) if debug else self._detect_select_server_button(screenshot)
+                if debug and isinstance(select_server_result, dict):
+                    select_server_button_detected = select_server_result.get('detected', False)
+                    if select_server_result.get('position'):
+                        annotations['templates'].append({
+                            'name': 'select_server_button',
+                            'position': select_server_result['position'],
+                            'confidence': select_server_result.get('confidence', 0),
+                            'size': select_server_result.get('size', (100, 100)),
+                            'below_threshold': select_server_result.get('below_threshold', False)
+                        })
+                else:
+                    select_server_button_detected = select_server_result if isinstance(select_server_result, bool) else False
+                logger.info(f"  - select_server_button.png detected: {select_server_button_detected}")
+
+                if tap_detected and select_server_button_detected:
+                    detected_state = 'select_server'
+                    logger.info(f"Game state detected: {detected_state} (tap text + select_server_button.png)")
+                    if debug:
+                        self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
+                        self._save_template_images(['select_server_button.png'])
+                    return detected_state
+
             # Rule 2: Check for "Character" text AND enter_button.png
             logger.info("Rule 2: Checking for 'Character' text and enter_button.png...")
             character_result = self._detect_character_text_debug(screenshot) if debug else self._detect_character_text(screenshot)
@@ -2399,6 +3178,8 @@ class GameDetector:
                     self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
                     self._save_template_images(['enter_button.png'])
                 return detected_state
+            else:
+                logger.info("Skipping select_server/select_character checks (already entered playing state).")
             
             # Rule 3: Check for short_button.png
             logger.info("Rule 3: Checking for short_button.png...")
@@ -2419,6 +3200,9 @@ class GameDetector:
             
             if fight_button_detected:
                 logger.info("Game state detected: 'playing' (short_button.png found)")
+                if not self._has_entered_playing:
+                    logger.debug("Marking playing state as reached; future detections will skip pre-play checks.")
+                self._has_entered_playing = True
                 
                 if debug:
                     self._save_debug_screenshot(screenshot, "detected_playing", annotations)
@@ -2434,8 +3218,22 @@ class GameDetector:
             logger.info(f"    - select_server_button: {select_server_button_detected}")
             logger.info(f"    - character text: {character_text_detected}")
             logger.info(f"    - enter_button: {enter_button_detected}")
+            logger.info(f"    - unlock_screen_region: {unlock_screen_detected}")
+            logger.info(f"    - claim_reward_button: {claim_reward_detected}")
+            logger.info(f"    - accepting_reward_button: {accepting_reward_detected}")
+            logger.info(f"    - close_cross: {close_cross_detected}")
+            logger.info(f"    - do_not_show_again: {do_not_show_detected}")
+            logger.info(f"    - confirm_tip: {confirm_tip_detected}")
+            logger.info(f"    - teleport_short_button: {teleport_short_button_detected}")
+            logger.info(f"    - teleport_text: {teleport_text_detected}")
+            logger.info(f"    - resurrect_text: {resurrect_text_detected}")
             logger.info(f"    - short_button: {fight_button_detected}")
+            logger.info(f"    - skip_button: {skip_button_detected}")
             logger.info(f"  Result: {detected_state}")
+
+            if self._has_entered_playing:
+                logger.info("Previously detected playing state; forcing detected state to 'playing'.")
+                return 'playing'
             
             if debug:
                 self._save_debug_screenshot(screenshot, f"detected_{detected_state}", annotations)
@@ -3534,3 +4332,142 @@ class GameDetector:
         except Exception as e:
             logger.error(f"Error getting installed packages: {e}")
             return []
+    
+    def has_entered_playing_state(self) -> bool:
+        """Return True if we've detected the playing state at least once this session."""
+        return self._has_entered_playing
+    
+    def get_detected_detailed_state(self) -> Optional[str]:
+        """
+        Get and clear the detected detailed game state.
+        This is used for states that should set detailed_game_state but not change actual_game_state.
+        
+        Returns:
+            The detected detailed state (e.g., 'teleporting') or None
+        """
+        state = self._detected_detailed_state
+        self._detected_detailed_state = None  # Clear after reading
+        return state
+    
+    def detect_quests_in_region(self, screenshot: np.ndarray) -> List[Tuple[int, int, float, Tuple[int, int]]]:
+        """Find quest buttons in the configured quests region and return matches sorted top-down."""
+        matches: List[Tuple[int, int, float, Tuple[int, int]]] = []
+        quests_region = self._get_region('quests')
+        if not quests_region:
+            logger.debug("Quests region not configured; skipping quest detection.")
+            return matches
+
+        x1, y1, x2, y2 = quests_region
+        screen_width = screenshot.shape[1]
+        screen_height = screenshot.shape[0]
+        x1 = max(0, min(x1, screen_width))
+        y1 = max(0, min(y1, screen_height))
+        x2 = max(0, min(x2, screen_width))
+        y2 = max(0, min(y2, screen_height))
+        if x2 <= x1 or y2 <= y1:
+            logger.debug("Quests region coordinates invalid; skipping quest detection.")
+            return matches
+
+        region = screenshot[y1:y2, x1:x2]
+        template_names = [
+            "quest_button.png",
+            "quest_button_highlight.png",
+            "quest_button_alt.png"
+        ]
+
+        for template_name in template_names:
+            template = self.template_matcher.load_template(template_name)
+            if template is None:
+                logger.debug(f"Quest template {template_name} missing; skipping.")
+                continue
+
+            detections = self.template_matcher.find_all_templates(
+                region,
+                template_name,
+                confidence=0.7,
+            )
+
+            for detection in detections or []:
+                det_x, det_y, det_confidence = detection
+                matches.append((
+                    int(x1 + det_x),
+                    int(y1 + det_y),
+                    float(det_confidence),
+                    (int(template.shape[1]), int(template.shape[0]))
+                ))
+
+        matches.sort(key=lambda item: item[1])
+        return matches
+
+    def tap_agent_quest_region_center(self, screenshot: Optional[np.ndarray] = None) -> bool:
+        """Tap the center of the configured agent quest region."""
+        agent_region = self._get_region('agent_quest_region')
+        if not agent_region:
+            logger.debug("agent_quest_region not configured; cannot tap center.")
+            return False
+
+        x1, y1, x2, y2 = agent_region
+        if screenshot is not None:
+            screen_width = screenshot.shape[1]
+            screen_height = screenshot.shape[0]
+            x1 = max(0, min(x1, screen_width))
+            y1 = max(0, min(y1, screen_height))
+            x2 = max(0, min(x2, screen_width))
+            y2 = max(0, min(y2, screen_height))
+
+        if x2 <= x1 or y2 <= y1:
+            logger.warning(f"Invalid agent_quest_region coordinates for center tap: ({x1}, {y1}, {x2}, {y2})")
+            return False
+
+        tap_x = (x1 + x2) // 2
+        tap_y = (y1 + y2) // 2
+        logger.info(f"Tapping agent quest region center at ({tap_x}, {tap_y})")
+
+        if self.adb and hasattr(self.adb, 'tap'):
+            success = self.adb.tap(int(tap_x), int(tap_y))
+            if success:
+                logger.info("Successfully tapped agent quest region center")
+                return True
+            logger.warning("Failed to tap agent quest region center")
+            return False
+
+        logger.warning("ADB manager not available or tap method not found for agent quest region center")
+        return False
+
+    # Rule 15: Check for accept_button.png
+    pass
+
+    def _detect_skip_text(self, region_image: np.ndarray) -> bool:
+        """
+        Detect "Skip" text in a region using Tesseract OCR.
+
+        Args:
+            region_image: OpenCV image array (cropped region)
+
+        Returns:
+            True if "Skip" text is detected, False otherwise
+        """
+        try:
+            from ..utils.tesseract_ocr import get_tesseract_reader
+            ocr_reader = get_tesseract_reader(lang='eng')
+            if ocr_reader is None:
+                return False
+
+            results = None
+            try:
+                results = ocr_reader.readtext(region_image, detail=1, paragraph=False)
+
+                skip_keywords = ['skip']
+                for (bbox, text, confidence) in results:
+                    text_lower = text.lower().strip()
+                    for keyword in skip_keywords:
+                        if keyword in text_lower:
+                            logger.info(f"Detected 'Skip' text: '{text}' (confidence: {confidence:.3f})")
+                            return True
+                return False
+            finally:
+                if results is not None:
+                    del results
+        except Exception as e:
+            logger.debug(f"Error detecting Skip text: {e}")
+            return False

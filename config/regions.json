@@ -175,28 +175,204 @@
       883
     ]
   ],
-  "estimated_weight_region": [
-    [
-      1224,
-      708,
-      1348,
-      760
-    ]
-  ],
-  "player": [
-    [
-      864,
-      482,
-      1084,
-      933
-    ]
-  ],
   "purchase_number_100_region": [
     [
       708,
       945,
       816,
       1015
+    ]
+  ],
+  "tips_confirm_button_region": [
+    [
+      153,
+      480,
+      415,
+      564
+    ]
+  ],
+  "reward_accept_button_region": [
+    [
+      1058,
+      780,
+      1180,
+      823
+    ]
+  ],
+  "stats_window_region": [
+    [
+      55,
+      127,
+      520,
+      883
+    ]
+  ],
+  "stats_window_title_region": [
+    [
+      55,
+      124,
+      182,
+      184
+    ]
+  ],
+  "stats_details_window_region": [
+    [
+      559,
+      206,
+      1154,
+      787
+    ]
+  ],
+  "stat_points_title_region": [
+    [
+      604,
+      136,
+      765,
+      182
+    ]
+  ],
+  "stat_details_title": [
+    [
+      866,
+      134,
+      974,
+      182
+    ]
+  ],
+  "do_not_show_again_region": [
+    [
+      112,
+      400,
+      336,
+      434
+    ]
+  ],
+  "tip_joining_confirm_region": [
+    [
+      120,
+      475,
+      237,
+      516
+    ]
+  ],
+  "confirm_description_region": [
+    [
+      703,
+      400,
+      1219,
+      453
+    ]
+  ],
+  "confirm_player_have": [
+    [
+      857,
+      550,
+      1148,
+      577
+    ]
+  ],
+  "confirm_price_region": [
+    [
+      850,
+      509,
+      1150,
+      544
+    ]
+  ],
+  "teleport_confirm_button_region": [
+    [
+      1051,
+      702,
+      1182,
+      743
+    ]
+  ],
+  "teleport_cancel_button_region": [
+    [
+      741,
+      700,
+      857,
+      741
+    ]
+  ],
+  "resurrect_button_region": [
+    [
+      787,
+      871,
+      964,
+      921
+    ]
+  ],
+  "confirm_purchase_button_region": [
+    [
+      1687,
+      960,
+      1824,
+      1003
+    ]
+  ],
+  "estimated_weight_region": [
+    [
+      1241,
+      722,
+      1272,
+      745
+    ]
+  ],
+  "back_button_region": [
+    [
+      1807,
+      21,
+      1874,
+      88
+    ]
+  ],
+  "player": [
+    [
+      805,
+      498,
+      1124,
+      917
+    ]
+  ],
+  "tip_window_region": [
+    [
+      50,
+      116,
+      548,
+      591
+    ]
+  ],
+  "claim_reward_button_region": [
+    [
+      852,
+      782,
+      945,
+      820
+    ]
+  ],
+  "skip_button_region": [
+    [
+      1689,
+      739,
+      1771,
+      775
+    ]
+  ],
+  "source_accept_button_region": [
+    [
+      1056,
+      765,
+      1180,
+      799
+    ]
+  ],
+  "source_claim_button_region": [
+    [
+      849,
+      765,
+      948,
+      804
     ]
   ]
 }
